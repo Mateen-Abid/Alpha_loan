@@ -1,41 +1,37 @@
-"""SMS Service - High-level SMS operations"""
+"""SMS Service - iCollector-backed SMS operations."""
 
-from .heymarket_client import HeymarketClient
+from __future__ import annotations
+
+import logging
+from typing import Any, Dict
+
+from apps.core.integrations import ICollectorClient, ICollectorClientError
+
+
+logger = logging.getLogger(__name__)
 
 
 class SMSService:
-    """Service layer for SMS operations"""
-    
-    def __init__(self):
-        self.client = HeymarketClient()
-    
+    """Service layer for SMS operations."""
+
+    def __init__(self) -> None:
+        self.client = ICollectorClient()
+
     def send_collection_sms(
         self,
+        row_id: str,
         phone_number: str,
         message: str,
-        case_id: str = None
-    ) -> Dict:
-        """
-        Send collection SMS to borrower.
-        
-        Args:
-            phone_number: Borrower phone
-            message: SMS message
-            case_id: Collection case ID for tracking
-        
-        Returns:
-            Response with external_id
-        """
-        result = self.client.send_sms(phone_number, message)
-        result['case_id'] = case_id
-        return result
-    
-    def send_courtesy_reminder(self, phone_number: str, case_id: str = None) -> Dict:
-        """Send courtesy payment reminder"""
-        message = "Hello, this is a courtesy reminder about your pending payment."
-        return self.send_collection_sms(phone_number, message, case_id)
-    
-    def send_urgency_message(self, phone_number: str, case_id: str = None) -> Dict:
-        """Send urgent payment request"""
-        message = "Your account requires immediate attention. Please contact us today."
-        return self.send_collection_sms(phone_number, message, case_id)
+    ) -> Dict[str, Any]:
+        """Send collection SMS through iCollector partner gateway."""
+        try:
+            response = self.client.send_sms(row_id=row_id, phone=phone_number, message=message)
+            return {
+                "status": "success",
+                "message_id": response.get("message_id") or response.get("id"),
+                "external_id": response.get("message_id") or response.get("id"),
+                "provider_response": response,
+            }
+        except ICollectorClientError as exc:
+            logger.error("SMS dispatch failed for row_id=%s: %s", row_id, exc)
+            return {"status": "failed", "error": str(exc)}

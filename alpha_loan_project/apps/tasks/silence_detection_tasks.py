@@ -28,7 +28,7 @@ def detect_silence_periods():
         logger.warning(f"Silence detected on case {case.account_id} - last contact {case.last_contact_at}")
         
         # Could trigger escalated collection attempts
-        attempt_escalated_contact(case)
+        attempt_escalated_contact.delay(case.id)
 
 
 @shared_task
@@ -45,18 +45,28 @@ def attempt_escalated_contact(case_id: int):
         # Try SMS first
         router.send_message(
             channel='sms',
-            recipient=case.borrower_phone,
-            message=message,
-            case_id=case.account_id
+            payload={
+                "row_id": case.partner_row_id or case.account_id,
+                "case_id": case.id,
+                "phone": case.borrower_phone,
+                "email": case.borrower_email,
+                "message": message,
+                "subject": "Urgent Account Notice",
+            },
         )
         
         # If email exists, also send email
         if case.borrower_email:
             router.send_message(
                 channel='email',
-                recipient=case.borrower_email,
-                message=message,
-                case_id=case.account_id
+                payload={
+                    "row_id": case.partner_row_id or case.account_id,
+                    "case_id": case.id,
+                    "phone": case.borrower_phone,
+                    "email": case.borrower_email,
+                    "message": message,
+                    "subject": "Urgent Account Notice",
+                },
             )
         
         logger.info(f"Escalated contact attempted for case {case.account_id}")

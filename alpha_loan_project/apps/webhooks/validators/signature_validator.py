@@ -3,7 +3,9 @@
 import hmac
 import hashlib
 import os
+import time
 from typing import Optional
+from urllib.parse import urlencode
 
 
 class SignatureValidator:
@@ -32,6 +34,46 @@ class SignatureValidator:
         ).hexdigest()
         
         return hmac.compare_digest(signature, expected_signature)
+
+    @staticmethod
+    def validate_icollector_signature(
+        body: bytes,
+        method: str,
+        path: str,
+        query_params: Optional[dict],
+        timestamp: str,
+        nonce: str,
+        signature: str,
+    ) -> bool:
+        """
+        Validate iCollector gateway webhook signature using canonical format.
+        """
+        # Per partner contract: outbound secret verifies webhook callbacks from iCollector.
+        secret = os.getenv("ICOLLECTOR_OUTBOUND_SECRET", "")
+        if not all([secret, timestamp, nonce, signature]):
+            return False
+        try:
+            request_ts = int(timestamp)
+        except ValueError:
+            return False
+        window_seconds = int(os.getenv("ICOLLECTOR_SIGNATURE_WINDOW_SECONDS", "300"))
+        now_ts = int(time.time())
+        if abs(now_ts - request_ts) > window_seconds:
+            return False
+        provided_signature = signature
+        if signature.startswith("sha256="):
+            provided_signature = signature.split("=", 1)[1]
+
+        query_string = f"?{urlencode(query_params, doseq=True)}" if query_params else ""
+        path_with_query = f"{path}{query_string}"
+        body_hash = hashlib.sha256(body).hexdigest()
+        canonical = f"{timestamp}.{nonce}.{method.upper()}.{path_with_query}.{body_hash}"
+        expected_signature = hmac.new(
+            secret.encode("utf-8"),
+            canonical.encode("utf-8"),
+            hashlib.sha256,
+        ).hexdigest()
+        return hmac.compare_digest(provided_signature, expected_signature)
     
     @staticmethod
     def validate_telnyx_signature(body: str, signature: str) -> bool:

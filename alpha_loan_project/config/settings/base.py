@@ -142,6 +142,14 @@ CACHES = {
     }
 }
 
+# iCollector Partner Gateway
+ICOLLECTOR_BASE_URL = os.getenv('ICOLLECTOR_BASE_URL', 'https://app.icollector.ai')
+ICOLLECTOR_API_KEY = os.getenv('ICOLLECTOR_API_KEY', '')
+ICOLLECTOR_API_TOKEN = os.getenv('ICOLLECTOR_API_TOKEN', ICOLLECTOR_API_KEY)
+ICOLLECTOR_TENANT = os.getenv('ICOLLECTOR_TENANT', '')
+ICOLLECTOR_INBOUND_SECRET = os.getenv('ICOLLECTOR_INBOUND_SECRET', '')
+ICOLLECTOR_OUTBOUND_SECRET = os.getenv('ICOLLECTOR_OUTBOUND_SECRET', '')
+
 # Logging
 LOGGING = {
     'version': 1,

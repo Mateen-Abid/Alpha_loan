@@ -1,5 +1,7 @@
 """Voice Service - High-level voice operations"""
 
+from typing import Dict
+
 from .telnyx_client import TelnyxClient
 from .twilio_client import TwilioClient
 
@@ -34,4 +36,6 @@ class VoiceService:
         result = self.client.initiate_call(phone_number, script=message)
         result['case_id'] = case_id
         result['provider'] = self.provider
+        if 'status' not in result:
+            result['status'] = 'success'
         return result

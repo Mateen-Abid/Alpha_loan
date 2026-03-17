@@ -1,6 +1,6 @@
 """Intent Analyzer - AI-powered intent detection"""
 
-from .intent_types import BorrowerIntent
+from . import BorrowerIntent
 from apps.ai.clients import OpenAIClient
 from typing import Dict, Tuple
 

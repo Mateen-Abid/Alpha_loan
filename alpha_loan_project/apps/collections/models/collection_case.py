@@ -22,9 +22,15 @@ class CollectionCase(models.Model):
         RESOLVED = 'RESOLVED', 'Resolved'
         LOST = 'LOST', 'Lost'
         SUSPENDED = 'SUSPENDED', 'Suspended'
+
+    class AutomationStatus(models.TextChoices):
+        ACTIVE = 'ACTIVE', 'Active'
+        PAUSED = 'PAUSED', 'Paused'
+        STOPPED = 'STOPPED', 'Stopped'
     
     # Account identifiers
     account_id = models.CharField(max_length=100, unique=True, db_index=True)
+    partner_row_id = models.CharField(max_length=100, unique=True, null=True, blank=True, db_index=True)
     borrower_name = models.CharField(max_length=255)
     borrower_email = models.EmailField(null=True, blank=True)
     borrower_phone = models.CharField(max_length=20, db_index=True)
@@ -50,6 +56,12 @@ class CollectionCase(models.Model):
         default=CollectionStatus.ACTIVE,
         db_index=True
     )
+    automation_status = models.CharField(
+        max_length=20,
+        choices=AutomationStatus.choices,
+        default=AutomationStatus.ACTIVE,
+        db_index=True,
+    )
     
     # Key dates
     delinquent_date = models.DateField(db_index=True)
@@ -57,6 +69,7 @@ class CollectionCase(models.Model):
     updated_at = models.DateTimeField(auto_now=True)
     last_contact_at = models.DateTimeField(null=True, blank=True, db_index=True)
     next_followup_at = models.DateTimeField(null=True, blank=True, db_index=True)
+    next_action_time = models.DateTimeField(null=True, blank=True, db_index=True)
     
     # Tracking
     does_not_call = models.BooleanField(default=False)
@@ -67,6 +80,7 @@ class CollectionCase(models.Model):
         ordering = ['-created_at']
         indexes = [
             models.Index(fields=['status', 'current_workflow_step']),
+            models.Index(fields=['automation_status', 'next_action_time']),
             models.Index(fields=['borrower_phone']),
             models.Index(fields=['next_followup_at']),
         ]

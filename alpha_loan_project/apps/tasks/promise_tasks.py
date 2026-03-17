@@ -67,9 +67,14 @@ def send_commitment_reminder():
         try:
             router.send_message(
                 channel='sms',
-                recipient=case.borrower_phone,
-                message=message,
-                case_id=case.account_id
+                payload={
+                    "row_id": case.partner_row_id or case.account_id,
+                    "case_id": case.id,
+                    "phone": case.borrower_phone,
+                    "email": case.borrower_email,
+                    "message": message,
+                    "subject": "Commitment Reminder",
+                },
             )
             logger.info(f"Reminder sent for commitment {commitment.id}")
         except Exception as e:

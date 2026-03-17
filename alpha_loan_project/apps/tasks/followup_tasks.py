@@ -1,130 +1,195 @@
-"""Follow-up Tasks - Scheduled follow-up messaging"""
+"""Follow-up Tasks - Scheduled follow-up messaging and inbound AI handling."""
+
+from __future__ import annotations
+
+from datetime import timedelta
+import logging
+from typing import Dict
 
 from celery import shared_task
 from django.utils import timezone
-from apps.collections.models import CollectionCase
-from apps.communications.services.communication_router import CommunicationRouter
-from apps.collections.workflows.workflow_states import WorkflowState, WorkflowActions
+
+from apps.ai.services.ai_orchestrator import AIOrchestrator
+from apps.collections.models import CollectionCase, InteractionLedger, PaymentCommitment
+from apps.collections.services.collection_service import CollectionService
 from apps.collections.workflows.state_machine import WorkflowStateMachine
-import logging
+from apps.collections.workflows.workflow_states import WorkflowActions, WorkflowState
+from apps.communications.services.communication_router import CommunicationRouter, ExternalDispatchError
 
 logger = logging.getLogger(__name__)
 
 
-@shared_task
-def send_followup_messages():
+def _build_case_context(case: CollectionCase) -> Dict[str, object]:
+    return {
+        "total_due": case.total_due,
+        "current_workflow_step": case.current_workflow_step,
+        "days_delinquent": case.get_age_in_days(),
+        "borrower_name": case.borrower_name,
+    }
+
+
+@shared_task(bind=True, autoretry_for=(ExternalDispatchError,), retry_backoff=True, retry_jitter=True, max_retries=5)
+def send_followup_messages(self):
     """
-    Scheduled task to send follow-up messages to cases needing contact.
-    Runs based on next_followup_at timestamp.
+    Send follow-up messages for active automation cases.
+    Idempotent behavior: skip if a matching outbound message already exists recently.
     """
     cases = CollectionCase.objects.filter(
-        status='ACTIVE',
-        next_followup_at__lte=timezone.now()
+        automation_status=CollectionCase.AutomationStatus.ACTIVE,
+        status=CollectionCase.CollectionStatus.ACTIVE,
+        next_action_time__lte=timezone.now(),
     )
-    
+
+    orchestrator = AIOrchestrator()
     router = CommunicationRouter()
-    
+
     for case in cases:
         try:
-            # Determine preferred channel (default to SMS)
-            channel = 'sms'  # Could be stored as preference
-            
-            message = f"Reminder: Payment of ${case.get_remaining_balance():.2f} is due on your account."
-            
-            result = router.send_message(
-                channel=channel,
-                recipient=case.borrower_phone if channel == 'sms' else case.borrower_email,
-                message=message,
-                case_id=case.account_id
+            ai_message = orchestrator.generate_outbound_message("sms", _build_case_context(case))
+            message = ai_message.get("message") or (
+                f"Reminder: Payment of ${case.get_remaining_balance():.2f} is due on your account."
             )
-            
-            if result.get('status') == 'success':
-                # Schedule next follow-up (3 days later)
-                case.next_followup_at = timezone.now() + timezone.timedelta(days=3)
-                case.save()
-            
+
+            duplicate_exists = InteractionLedger.objects.filter(
+                collection_case=case,
+                interaction_type=InteractionLedger.InteractionType.OUTBOUND,
+                channel=InteractionLedger.CommunicationChannel.SMS,
+                message_content=message,
+                created_at__gte=timezone.now() - timedelta(minutes=5),
+            ).exists()
+            if duplicate_exists:
+                logger.info("Skipping duplicate follow-up dispatch for case %s", case.account_id)
+                continue
+
+            payload = {
+                "row_id": case.partner_row_id or case.account_id,
+                "case_id": case.id,
+                "phone": case.borrower_phone,
+                "email": case.borrower_email,
+                "message": message,
+                "subject": "Collection Reminder",
+                "ai_generated": bool(ai_message.get("status") == "success"),
+            }
+            channel = "sms" if case.borrower_phone else "email"
+            router.send_message(channel=channel, payload=payload)
+
+            next_run = timezone.now() + timedelta(days=3)
+            case.next_action_time = next_run
+            case.next_followup_at = next_run
+            case.last_contact_at = timezone.now()
+            case.save(update_fields=["next_action_time", "next_followup_at", "last_contact_at", "updated_at"])
+
             logger.info(f"Follow-up message sent for case {case.account_id}")
         except Exception as e:
             logger.error(f"Error sending follow-up for case {case.account_id}: {str(e)}")
+            raise
 
 
-@shared_task
-def process_borrowed_message(case_id: int, interaction_id: int, message: str):
+@shared_task(bind=True, autoretry_for=(ExternalDispatchError,), retry_backoff=True, retry_jitter=True, max_retries=5)
+def process_borrower_message(self, case_id: int, interaction_id: int, message: str, channel: str = "sms"):
     """
-    Process incoming borrower message using AI.
-    Detects intent and may trigger workflow transitions.
+    Process inbound borrower message with AI intent + response handling.
     """
     try:
-        from apps.collections.models import InteractionLedger
-        from apps.ai.services.ai_orchestrator import AIOrchestrator
-        
         case = CollectionCase.objects.get(id=case_id)
         interaction = InteractionLedger.objects.get(id=interaction_id)
-        
-        # Process message with AI
+
+        if interaction.ai_processed_at:
+            logger.info("Skipping already-processed interaction_id=%s", interaction_id)
+            return {"status": "success", "idempotent": True}
+
         orchestrator = AIOrchestrator()
-        ai_result = orchestrator.process_borrower_message(message, {
-            'total_due': case.total_due,
-            'current_workflow_step': case.current_workflow_step,
-            'days_delinquent': case.get_age_in_days(),
-            'borrower_name': case.borrower_name
-        })
-        
-        # Update interaction with AI analysis
-        intent_data = ai_result.get('intent', {})
-        interaction.ai_intent_detected = intent_data.get('intent')
-        interaction.ai_sentiment_score = intent_data.get('confidence')
+        ai_result = orchestrator.process_borrower_message(message, _build_case_context(case))
+        intent_data = ai_result.get("intent", {})
+        intent = intent_data.get("intent")
+
+        interaction.ai_intent_detected = intent
+        interaction.ai_sentiment_score = intent_data.get("confidence")
         interaction.ai_processed_at = timezone.now()
-        interaction.status = 'REPLIED'
+        interaction.status = InteractionLedger.InteractionStatus.REPLIED
+        interaction.reply_message = ai_result.get("suggested_response", {}).get("message")
         interaction.save()
-        
-        # Handle workflow state transitions
-        intent = intent_data.get('intent')
-        
-        if intent == 'refusal':
-            # Borrower refused - advance workflow
-            state_machine = WorkflowStateMachine(
-                WorkflowState[case.current_workflow_step]
-            )
+
+        if intent == "refusal":
+            state_machine = WorkflowStateMachine(WorkflowState[case.current_workflow_step])
             if state_machine.transition(WorkflowActions.BORROWER_REFUSED):
                 case.current_workflow_step = state_machine.current_state.value
-                case.save()
+                case.workflow_step_started_at = timezone.now()
                 logger.info(f"Workflow advanced for case {case.account_id}")
-        
-        elif intent == 'promise_to_pay':
-            # Record commitment
-            from apps.collections.services.collection_service import CollectionService
-            from datetime import datetime, timedelta
-            
-            promised_date = (datetime.now() + timedelta(days=3)).date()
-            CollectionService.create_payment_commitment(
-                case=case,
+
+        elif intent == "promise_to_pay":
+            promised_date = (timezone.now() + timedelta(days=3)).date()
+            exists = PaymentCommitment.objects.filter(
+                collection_case=case,
                 committed_amount=case.get_remaining_balance(),
                 promised_date=promised_date,
-                payment_method='Phone'
-            )
-        
+                status__in=["PENDING", "CONFIRMED"],
+            ).exists()
+            if not exists:
+                CollectionService.create_payment_commitment(
+                    case=case,
+                    committed_amount=case.get_remaining_balance(),
+                    promised_date=promised_date,
+                    payment_method="Unspecified",
+                    commitment_source=channel.upper(),
+                    notes="Auto-created from AI intent detection",
+                )
+
+        case.last_contact_at = timezone.now()
+        case.next_action_time = timezone.now() + timedelta(days=2)
+        case.next_followup_at = case.next_action_time
+        case.save(
+            update_fields=[
+                "current_workflow_step",
+                "workflow_step_started_at",
+                "last_contact_at",
+                "next_action_time",
+                "next_followup_at",
+                "updated_at",
+            ]
+        )
+
+        suggested = ai_result.get("suggested_response", {})
+        suggested_message = suggested.get("message")
+        if suggested_message:
+            router = CommunicationRouter()
+            payload = {
+                "row_id": case.partner_row_id or case.account_id,
+                "case_id": case.id,
+                "phone": case.borrower_phone,
+                "email": case.borrower_email,
+                "message": suggested_message,
+                "subject": "Account Update",
+                "ai_generated": True,
+            }
+            outbound_channel = "sms" if case.borrower_phone else "email"
+            router.send_message(outbound_channel, payload)
+
         logger.info(f"Processed message for case {case.account_id}, intent: {intent}")
+        return {"status": "success", "intent": intent}
     except Exception as e:
         logger.error(f"Error processing borrowed message: {str(e)}")
+        raise
 
 
-@shared_task
-def process_voice_transcript(case_id: int, interaction_id: int, transcript: str):
+@shared_task(bind=True)
+def process_borrowed_message(self, case_id: int, interaction_id: int, message: str):
+    """Backward-compatible task alias."""
+    return process_borrower_message.run(case_id=case_id, interaction_id=interaction_id, message=message, channel="sms")
+
+
+@shared_task(bind=True, autoretry_for=(ExternalDispatchError,), retry_backoff=True, retry_jitter=True, max_retries=5)
+def process_voice_transcript(self, case_id: int, interaction_id: int, transcript: str):
     """Process voice call transcript"""
     try:
         case = CollectionCase.objects.get(id=case_id)
-        # Similar to SMS processing
-        from apps.ai.services.ai_orchestrator import AIOrchestrator
-        
-        orchestrator = AIOrchestrator()
-        ai_result = orchestrator.process_borrower_message(transcript, {
-            'total_due': case.total_due,
-            'current_workflow_step': case.current_workflow_step,
-            'days_delinquent': case.get_age_in_days(),
-            'borrower_name': case.borrower_name
-        })
-        
+        interaction = InteractionLedger.objects.get(id=interaction_id)
+        if interaction.ai_processed_at:
+            return {"status": "success", "idempotent": True}
+
+        process_borrower_message.run(case_id=case.id, interaction_id=interaction.id, message=transcript, channel="voice")
         logger.info(f"Processed voice transcript for case {case.account_id}")
+        return {"status": "success"}
     except Exception as e:
         logger.error(f"Error processing voice transcript: {str(e)}")
+        raise
