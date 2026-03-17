@@ -1,0 +1,444 @@
+openapi: 3.0.3
+info:
+  title: Alpha Loans Collections API
+  version: 1.0.0
+  description: AI-driven automated debt recovery platform
+paths:
+  /api/schema/:
+    get:
+      operationId: api_schema_retrieve
+      description: |-
+        OpenApi3 schema for this API. Format can be selected via content negotiation.
+
+        - YAML: application/vnd.oai.openapi
+        - JSON: application/vnd.oai.openapi+json
+      parameters:
+      - in: query
+        name: format
+        schema:
+          type: string
+          enum:
+          - json
+          - yaml
+      - in: query
+        name: lang
+        schema:
+          type: string
+          enum:
+          - af
+          - ar
+          - ar-dz
+          - ast
+          - az
+          - be
+          - bg
+          - bn
+          - br
+          - bs
+          - ca
+          - ckb
+          - cs
+          - cy
+          - da
+          - de
+          - dsb
+          - el
+          - en
+          - en-au
+          - en-gb
+          - eo
+          - es
+          - es-ar
+          - es-co
+          - es-mx
+          - es-ni
+          - es-ve
+          - et
+          - eu
+          - fa
+          - fi
+          - fr
+          - fy
+          - ga
+          - gd
+          - gl
+          - he
+          - hi
+          - hr
+          - hsb
+          - hu
+          - hy
+          - ia
+          - id
+          - ig
+          - io
+          - is
+          - it
+          - ja
+          - ka
+          - kab
+          - kk
+          - km
+          - kn
+          - ko
+          - ky
+          - lb
+          - lt
+          - lv
+          - mk
+          - ml
+          - mn
+          - mr
+          - ms
+          - my
+          - nb
+          - ne
+          - nl
+          - nn
+          - os
+          - pa
+          - pl
+          - pt
+          - pt-br
+          - ro
+          - ru
+          - sk
+          - sl
+          - sq
+          - sr
+          - sr-latn
+          - sv
+          - sw
+          - ta
+          - te
+          - tg
+          - th
+          - tk
+          - tr
+          - tt
+          - udm
+          - uk
+          - ur
+          - uz
+          - vi
+          - zh-hans
+          - zh-hant
+      tags:
+      - api
+      security:
+      - tokenAuth: []
+      - cookieAuth: []
+      - {}
+      responses:
+        '200':
+          content:
+            application/vnd.oai.openapi:
+              schema:
+                type: object
+                additionalProperties: {}
+            application/yaml:
+              schema:
+                type: object
+                additionalProperties: {}
+            application/vnd.oai.openapi+json:
+              schema:
+                type: object
+                additionalProperties: {}
+            application/json:
+              schema:
+                type: object
+                additionalProperties: {}
+          description: ''
+  /api/webhooks/crm/:
+    post:
+      operationId: api_webhooks_crm_create
+      description: Handle CRM webhooks for payment and case events
+      tags:
+      - api
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CRMWebhook'
+          application/x-www-form-urlencoded:
+            schema:
+              $ref: '#/components/schemas/CRMWebhook'
+          multipart/form-data:
+            schema:
+              $ref: '#/components/schemas/CRMWebhook'
+        required: true
+      security:
+      - tokenAuth: []
+      - cookieAuth: []
+      - {}
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WebhookResponse'
+          description: ''
+  /api/webhooks/email/:
+    post:
+      operationId: api_webhooks_email_create
+      description: Handle email webhooks
+      tags:
+      - api
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/EmailWebhook'
+          application/x-www-form-urlencoded:
+            schema:
+              $ref: '#/components/schemas/EmailWebhook'
+          multipart/form-data:
+            schema:
+              $ref: '#/components/schemas/EmailWebhook'
+        required: true
+      security:
+      - tokenAuth: []
+      - cookieAuth: []
+      - {}
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WebhookResponse'
+          description: ''
+  /api/webhooks/sms/:
+    post:
+      operationId: api_webhooks_sms_create
+      description: |-
+        Handle SMS webhooks from iCollector gateway.
+
+        Receives borrower SMS messages and processes them through the collections workflow.
+      tags:
+      - api
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SMSWebhook'
+          application/x-www-form-urlencoded:
+            schema:
+              $ref: '#/components/schemas/SMSWebhook'
+          multipart/form-data:
+            schema:
+              $ref: '#/components/schemas/SMSWebhook'
+        required: true
+      security:
+      - tokenAuth: []
+      - cookieAuth: []
+      - {}
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WebhookResponse'
+          description: ''
+  /api/webhooks/voice/:
+    post:
+      operationId: api_webhooks_voice_create
+      description: Handle voice call webhooks from Telnyx/Twilio
+      tags:
+      - api
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/VoiceWebhook'
+          application/x-www-form-urlencoded:
+            schema:
+              $ref: '#/components/schemas/VoiceWebhook'
+          multipart/form-data:
+            schema:
+              $ref: '#/components/schemas/VoiceWebhook'
+        required: true
+      security:
+      - tokenAuth: []
+      - cookieAuth: []
+      - {}
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WebhookResponse'
+          description: ''
+components:
+  schemas:
+    CRMWebhook:
+      type: object
+      description: CRM Webhook Request Serializer
+      properties:
+        row_id:
+          type: integer
+          description: CRM row ID
+        failed_payment_amount:
+          type: number
+          format: double
+          description: Amount of failed payment
+        board_id:
+          type: integer
+          description: CRM board ID
+        phone:
+          type: string
+          description: Borrower phone
+          maxLength: 20
+        email:
+          type: string
+          format: email
+          description: Borrower email
+        event_type:
+          type: string
+          description: Event type (created, updated, moved)
+          maxLength: 50
+        return_reason:
+          type: string
+          description: Return reason e.g. nsf
+          maxLength: 50
+        external_id:
+          type: string
+          description: Row external ID
+          maxLength: 100
+      required:
+      - failed_payment_amount
+      - row_id
+    EmailWebhook:
+      type: object
+      description: Email Webhook Request Serializer
+      properties:
+        row_id:
+          type: integer
+          description: CRM row ID
+        from_field:
+          type: string
+          format: email
+          description: Sender email
+        email:
+          type: string
+          format: email
+          description: Borrower email
+        to_email:
+          type: string
+          format: email
+          description: Recipient email address
+        subject:
+          type: string
+          description: Email subject
+          maxLength: 200
+        body:
+          type: string
+          description: Email body
+        message_id:
+          type: string
+          description: Unique message ID
+          maxLength: 100
+        external_id:
+          type: string
+          description: Borrower external ID
+          maxLength: 100
+        timestamp:
+          type: string
+          format: date-time
+          description: ISO 8601 timestamp
+      required:
+      - body
+      - message_id
+      - subject
+    SMSWebhook:
+      type: object
+      description: SMS Webhook Request Serializer
+      properties:
+        row_id:
+          type: integer
+          description: CRM row ID
+        from_field:
+          type: string
+          description: Sender identifier
+        phone:
+          type: string
+          description: Borrower phone number
+          maxLength: 20
+        message:
+          type: string
+          description: SMS message text
+        message_id:
+          type: string
+          description: Unique message ID
+          maxLength: 100
+        external_id:
+          type: string
+          description: Borrower external ID
+          maxLength: 100
+        timestamp:
+          type: string
+          format: date-time
+          description: ISO 8601 timestamp
+      required:
+      - message
+      - message_id
+    VoiceWebhook:
+      type: object
+      description: Voice Webhook Request Serializer
+      properties:
+        phone:
+          type: string
+          description: Borrower phone number
+          maxLength: 20
+        call_id:
+          type: string
+          description: Unique call ID
+          maxLength: 100
+        transcript:
+          type: string
+          description: Call transcript
+        duration:
+          type: integer
+          description: Call duration in seconds
+        external_id:
+          type: string
+          description: Borrower external ID
+          maxLength: 100
+        timestamp:
+          type: string
+          format: date-time
+          description: ISO 8601 timestamp
+      required:
+      - call_id
+      - phone
+    WebhookResponse:
+      type: object
+      description: Webhook Response Serializer
+      properties:
+        status:
+          type: string
+          description: success or error
+          maxLength: 20
+        case_id:
+          type: integer
+          description: CollectionCase ID if created
+        interaction_id:
+          type: integer
+          description: InteractionLedger ID if created
+        message:
+          type: string
+          description: Response message
+        error:
+          type: string
+          description: Error message if failed
+      required:
+      - status
+  securitySchemes:
+    cookieAuth:
+      type: apiKey
+      in: cookie
+      name: sessionid
+    tokenAuth:
+      type: apiKey
+      in: header
+      name: Authorization
+      description: Token-based authentication with required prefix "Token"

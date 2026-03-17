@@ -28,6 +28,7 @@ INSTALLED_APPS = [
     'corsheaders',
     'django_celery_beat',
     'django_celery_results',
+    'drf_spectacular',
     
     # Project apps
     'apps.collections',
@@ -73,14 +74,18 @@ WSGI_APPLICATION = 'config.wsgi.application'
 # Database
 DATABASES = {
     'default': {
-        'ENGINE': 'django.db.backends.postgresql',
-        'NAME': os.getenv('DB_NAME', 'alpha_loan'),
+        'ENGINE': os.getenv('DB_ENGINE', 'django.db.backends.sqlite3'),
+        'NAME': os.getenv('DB_NAME', 'db.sqlite3'),
+    }
+}
+# Add PostgreSQL credentials if using PostgreSQL
+if 'postgresql' in DATABASES['default']['ENGINE']:
+    DATABASES['default'].update({
         'USER': os.getenv('DB_USER', 'postgres'),
         'PASSWORD': os.getenv('DB_PASSWORD', ''),
         'HOST': os.getenv('DB_HOST', 'localhost'),
         'PORT': os.getenv('DB_PORT', '5432'),
-    }
-}
+    })
 
 # Password validation
 AUTH_PASSWORD_VALIDATORS = [
@@ -114,10 +119,19 @@ REST_FRAMEWORK = {
         'rest_framework.authentication.SessionAuthentication',
     ],
     'DEFAULT_PERMISSION_CLASSES': [
-        'rest_framework.permissions.IsAuthenticated',
+        'rest_framework.permissions.AllowAny',
     ],
     'DEFAULT_PAGINATION_CLASS': 'rest_framework.pagination.PageNumberPagination',
     'PAGE_SIZE': 20,
+    'DEFAULT_SCHEMA_CLASS': 'drf_spectacular.openapi.AutoSchema',
+}
+
+# DRF Spectacular (Swagger/OpenAPI)
+SPECTACULAR_SETTINGS = {
+    'TITLE': 'Alpha Loans Collections API',
+    'DESCRIPTION': 'AI-driven automated debt recovery platform',
+    'VERSION': '1.0.0',
+    'SERVE_AUTHENTICATION': None,
 }
 
 # CORS

@@ -2,6 +2,12 @@
 """Django management command."""
 import os
 import sys
+from pathlib import Path
+
+# Load environment variables from .env
+from dotenv import load_dotenv
+env_file = Path(__file__).resolve().parent / '.env'
+load_dotenv(env_file)
 
 
 def main():
