@@ -18,6 +18,7 @@ urlpatterns = [
     path('api/collections/', include('apps.collections.urls')),
     path('api/communications/', include('apps.communications.urls')),
     path('api/webhooks/', include('apps.webhooks.urls')),
+    path('api/partner-gateway/v1/', include('apps.core.urls')),
 ]
 
 if settings.DEBUG:
