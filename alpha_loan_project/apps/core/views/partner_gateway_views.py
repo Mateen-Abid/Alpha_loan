@@ -11,6 +11,7 @@ from rest_framework.decorators import api_view
 from rest_framework.response import Response
 
 from apps.core.integrations import ICollectorClient, ICollectorClientError
+from apps.core.services import CRMIngestService
 
 
 def _parse_int_query_param(name: str, value: Optional[str]) -> tuple[Optional[int], Optional[str]]:
@@ -105,6 +106,50 @@ def crm_board_rows(request, board_id: str):
             group_id=group_id,
         )
         return Response(result, status=status.HTTP_200_OK)
+    except ICollectorClientError as exc:
+        return Response({"status": "failed", "error": str(exc)}, status=status.HTTP_502_BAD_GATEWAY)
+
+
+class CRMIngestSyncRequestSerializer(serializers.Serializer):
+    board_ids = serializers.ListField(
+        child=serializers.IntegerField(min_value=1),
+        required=False,
+        allow_empty=False,
+        help_text="Board IDs to sync. Defaults to service defaults when omitted.",
+    )
+    group_ids_by_board = serializers.DictField(
+        child=serializers.ListField(child=serializers.IntegerField(min_value=1), allow_empty=False),
+        required=False,
+        help_text="Optional board -> group IDs mapping. Example: {'70': [91]}",
+    )
+    dry_run = serializers.BooleanField(required=False, default=True)
+    limit = serializers.IntegerField(required=False, min_value=1, max_value=500, default=100)
+    max_pages_per_group = serializers.IntegerField(required=False, min_value=1, max_value=500, default=50)
+
+
+@extend_schema(
+    description=(
+        "Run Step 2 CRM ingest pipeline (ingest + normalize + upsert + report). "
+        "Use dry_run=true for safe validation before writing database records."
+    ),
+    request=CRMIngestSyncRequestSerializer,
+    responses=OpenApiTypes.OBJECT,
+)
+@api_view(["POST"])
+def crm_ingest_sync(request):
+    serializer = CRMIngestSyncRequestSerializer(data=request.data or {})
+    serializer.is_valid(raise_exception=True)
+    payload = serializer.validated_data
+
+    try:
+        result = CRMIngestService().sync(
+            board_ids=payload.get("board_ids"),
+            group_ids_by_board=payload.get("group_ids_by_board"),
+            dry_run=payload.get("dry_run", True),
+            limit=payload.get("limit", 100),
+            max_pages_per_group=payload.get("max_pages_per_group", 50),
+        )
+        return Response({"status": "success", "sync_report": result}, status=status.HTTP_200_OK)
     except ICollectorClientError as exc:
         return Response({"status": "failed", "error": str(exc)}, status=status.HTTP_502_BAD_GATEWAY)
 
