@@ -53,8 +53,10 @@ class GeminiClient:
         Returns:
             Generated message text
         """
+        first_name = borrower_name.split()[0]
+        
         prompt = self._build_message_prompt(
-            borrower_name=borrower_name,
+            first_name=first_name,
             failed_amount=failed_amount,
             nsf_fee=nsf_fee,
             current_balance=current_balance,
@@ -69,11 +71,12 @@ class GeminiClient:
                 contents=prompt
             )
             if response.text:
-                return self._sanitize_message(response.text.strip())
-            return self._fallback_message(borrower_name, failed_amount, nsf_fee)
+                sanitized = self._sanitize_message(response.text.strip())
+                return self._humanize_text(sanitized)
+            return self._fallback_message(first_name, failed_amount, nsf_fee, wave)
         except Exception as exc:
             logger.error(f"Gemini API error: {exc}")
-            return self._fallback_message(borrower_name, failed_amount, nsf_fee)
+            return self._fallback_message(first_name, failed_amount, nsf_fee, wave)
 
     def detect_intent(
         self,
@@ -116,7 +119,7 @@ class GeminiClient:
 
     @staticmethod
     def _build_message_prompt(
-        borrower_name: str,
+        first_name: str,
         failed_amount: float,
         nsf_fee: float,
         current_balance: float,
@@ -138,34 +141,62 @@ class GeminiClient:
         total_due = failed_amount + nsf_fee
         
         prompt = f"""
-You are a professional collections agent writing a short, human, SMS-style message.
+You are mike or sarah, a REAL collections agent texting {first_name} casually on their phone.
+
+REQUIRED FORMAT - START YOUR MESSAGE WITH THIS:
+"hey {first_name}, this is [mike or sarah] from [company name]..."
+
+Then continue naturally. You're having a brief conversation, not sending a corporate email.
 
 Details:
-- Name: {borrower_name}
+- Borrower: {first_name}
 - Failed Payment: ${failed_amount:.2f}
 - NSF Fee: ${nsf_fee:.2f}
 - Total Due: ${total_due:.2f}
-- Balance: ${current_balance:.2f}
-- Reason: {reason}
-- Escalation: Wave {wave} ({wave_desc})
-- Tone: {tone}
+- Wave {wave}
 
-Instructions:
-- Sound natural, like a real human texting (NOT robotic or templated)
-- Be clear, polite, and slightly empathetic
-- Keep it under 3 sentences
-- Mention payment failure + total due clearly
-- Encourage action (pay/update details), but NO phone call instructions
-- Adjust tone:
-  • Wave 1-2 → friendly, understanding  
-  • Wave 3-4 → firmer, more urgent but still respectful
+YOUR TONE (CRITICAL):
+✓ ALWAYS start: "hey {first_name}, this is [agent] from [company]..."
+✓ Pick any company name (iloans, fashloan, quickcash, loanpro, etc.) - make it realistic
+✓ Conversational and direct after the intro
+✓ Use dropped caps, contractions, casual words (gotta, wanna, gonna, etc.)
+✓ Slightly imperfect grammar = HUMAN
+✓ NO gendered casual language - NEVER say "man", "buddy", "dude", "bro"
+✓ Say things like: "we gotta figure this out", "can you send that in?", "the latest I can go is Friday"
+✓ 2-3 short casual sentences MAX (after intro)
+✗ NO formal bank language: avoid "Hi", "we see that", "to resolve", "kindly", "update payment information"
+✗ NO robotic phrases: "unsuccessful", "has declined", "current balance is"
+✗ NO excessive politeness or structure
+✗ Do not sound like a bank email AT ALL
 
-Avoid:
-- Repeating numbers unnecessarily
-- Robotic phrasing like “we see that”
-- Overly formal or legal tone
+Must mention:
+- Payment bounced/failed
+- Total due amount
+- When you need it (ask for deadline)
 
-Write ONE clean message only.
+Wave guidance:
+- Wave 1: Friendly, straightforward, helpful vibe - offer to help solve problem
+- Wave 2: More direct and firm - they know they owe money, need quick payment
+- Wave 3: Urgent and serious - legal escalation territory, ASAP tone
+- Wave 4: Final pressure - URGENT, RIGHT NOW, CONSEQUENCES, no more negotiating
+
+EXAMPLES TO MATCH TONE (ALL START WITH AGENT INTRO):
+Wave 1 (Friendly): "hey {first_name}, this is mike from iloans. your payment bounced. we gotta figure this out. when can you take care of it?"
+Wave 2 (Firm): "hey {first_name}, this is sarah from fashloan. look, your payment bounced. I need ${total_due:.2f} from you. when can you send it?"
+Wave 3 (Urgent): "yo {first_name}, this is mike from quickcash. your payment bounced. we need ${total_due:.2f} ASAP. this is serious. when can you handle this?"
+Wave 4 (Final): "hey {first_name}, this is sarah from loanpro. your payment bounced. this is URGENT and FINAL - we need ${total_due:.2f} RIGHT NOW. respond immediately."
+
+WAVE {wave} SPECIFIC RULES:
+- Wave 1: Be friendly and helpful. Show you want to collaborate to fix the problem.
+- Wave 2: Still respectful but firmer. They had their chance, now need concrete timeline.
+- Wave 3: Urgent and serious. Use ASAP, serious, important. This is legal territory.
+- Wave 4: FINAL AND URGENT. Use RIGHT NOW, URGENT, FINAL, IMMEDIATE, DO NOT IGNORE.
+
+CRITICAL: 
+- EVERY message MUST start with "hey {first_name}, this is [agent] from [company]..."
+- If your response sounds like a bank wrote it, REWRITE IT. It should sound like a real person, not AI.
+
+Generate ONLY the message text. No explanations. No brackets. Just raw text like a real text message.
 """
         
         return prompt.strip()
@@ -180,7 +211,7 @@ Write ONE clean message only.
         """
         context_str = ""
         if case_context:
-            context_str = f"\nCase Context: Amount due ${case_context.get('amount_due', 0)}, Wave {case_context.get('wave', 1)}"
+            context_str = f"\nCase Context: Amount due ${case_context.get('amount_due', 0)}, Wave {case_context.get('wave', 3)}"
         
         prompt = f"""
         Analyze the borrower's message and classify their intent.{context_str}
@@ -238,19 +269,30 @@ Write ONE clean message only.
 
     @staticmethod
     def _fallback_message(
-        borrower_name: str,
+        first_name: str,
         failed_amount: float,
         nsf_fee: float,
+        wave: int = 1,
     ) -> str:
         """
-        Fallback message if Gemini API fails.
+        Fallback message if Gemini API fails. Wave-specific escalation, no gendered language.
         """
         total_due = failed_amount + nsf_fee
-        return (
-            f"Hi {borrower_name}, we see that your last payment for ${failed_amount:.2f} was stopped/failed. "
-            f"We need ${failed_amount:.2f} + ${nsf_fee:.2f} NSF fee now. "
-            f"Your current balance is ${total_due:.2f}. To resolve or update payment information, complete payment today."
-        )
+        companies = ["iLoans", "QuickCash", "LoanPro", "FastFunds", "CashFlow"]
+        company = companies[wave % len(companies)]
+        
+        if wave == 1:
+            # Friendly and helpful
+            return f"hey {first_name}, this is mike from {company}. your payment bounced. we gotta figure this out. total is ${total_due:.2f}. when can you take care of it?"
+        elif wave == 2:
+            # More firm
+            return f"hey {first_name}, this is sarah from {company}. look, your payment bounced. I need ${total_due:.2f} from you. when can you send it?"
+        elif wave == 3:
+            # Urgent and serious
+            return f"hey {first_name}, this is mike from {company}. your payment bounced. we need ${total_due:.2f} ASAP. this is serious. when can you handle this?"
+        else:  # wave 4
+            # Final pressure - URGENT
+            return f"hey {first_name}, this is sarah from {company}. URGENT - your payment bounced. we need ${total_due:.2f} RIGHT NOW. this is final. respond immediately."
 
     @staticmethod
     def _sanitize_message(message: str) -> str:
@@ -269,3 +311,83 @@ Write ONE clean message only.
             cleaned = cleaned.replace(phrase.title(), "Resolve or update payment information")
 
         return cleaned
+
+    def _humanize_text(self, text: str) -> str:
+        """Aggressively post-process to convert formal language to actual human texting."""
+        replacements = {
+            # Remove gendered casual language (handle all variations)
+            ", man": "",
+            " man.": ".",
+            " man,": ",",
+            ", buddy": "",
+            " buddy.": ".",
+            " buddy,": ",",
+            ", dude": "",
+            " dude.": ".",
+            " dude,": ",",
+            ", bro": "",
+            " bro.": ".",
+            " bro,": ",",
+            
+            # Casual action phrases
+            "get that sent over": "take care of this",
+            "get that to me": "get that sorted",
+            "send that in": "get it handled",
+            "send it today": "take care of it",
+            "get this in": "take care of this",
+            "get that in": "get that sorted",
+            
+            # Greetings
+            "Hi ": "hey ",
+            "Hello ": "hey ",
+            
+            # Formal payment language
+            "your last payment was unsuccessful": "your payment bounced",
+            "your last payment has been unsuccessful": "your payment bounced",
+            "your payment was unsuccessful": "your payment bounced",
+            "your payment was stopped": "your payment bounced",
+            "payment was stopped": "payment bounced",
+            "was stopped/failed": "bounced",
+            "has been declined": "didn't go through",
+            "has failed": "bounced",
+            "failed to process": "bounced",
+            
+            # Formal business language
+            "We see that": "look,",
+            "we see that": "look,",
+            "We need": "I need",
+            "we need": "I need",
+            "We have": "I got",
+            "we have": "I got",
+            "current balance is": "total's",
+            "Your current balance is": "total's",
+            "the total owed is": "total's",
+            # Replace "and" only when it's a standalone word (surrounded by spaces or punctuation)
+            " and ": " & ",
+            " and.": " &.",
+            " and,": " &,",
+            " and?": " &?",
+            " and!": " &!",
+            
+            # Formal action language
+            "to resolve": "to sort",
+            "to update payment information": "to get this sorted",
+            "resolve or update payment information": "get this handled",
+            "update payment": "send payment",
+            "please": "",
+            "kindly": "",
+            
+            # Fee language
+            "NSF fee": "NSF charge",
+            "+ ": "& ",
+        }
+        
+        result = text
+        for old, new in replacements.items():
+            result = result.replace(old, new)
+        
+        # Clean up double spaces
+        while "  " in result:
+            result = result.replace("  ", " ")
+        
+        return result.strip()

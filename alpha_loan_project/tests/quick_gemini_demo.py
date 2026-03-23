@@ -25,12 +25,18 @@ from datetime import datetime
 if sys.platform == "win32":
     sys.stdout.reconfigure(encoding='utf-8')
 
+# Add parent directory to path for imports
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 # Load .env file if available
 try:
     from dotenv import load_dotenv
     load_dotenv()
 except ImportError:
     pass
+
+# Import the GeminiClient
+from apps.ai.clients.gemini_client import GeminiClient
 
 
 # Sample borrower for quick demo
@@ -45,7 +51,7 @@ DEMO_BORROWER = {
 
 
 def demo_message_generation():
-    """Quick demo of Gemini message generation."""
+    """Quick demo of Gemini message generation using GeminiClient for all 4 waves."""
     
     # Check API key
     api_key = os.getenv("GEMINI_API_KEY")
@@ -62,136 +68,91 @@ def demo_message_generation():
         print("  4. Run: python tests/quick_gemini_demo.py")
         return
     
+    # Initialize GeminiClient
     try:
-        import google.genai as genai
+        client = GeminiClient(api_key=api_key)
     except ImportError:
         print("\n❌ Missing google.genai")
         print("   Install with: pip install google.genai")
         return
     
-    # Configure Gemini client
-    client = genai.Client(api_key=api_key)
-    model = "gemini-2.5-flash"
-    
     # Display demo header
     print("\n" + "="*80)
-    print("🤖 GEMINI AI MESSAGE GENERATION - QUICK DEMO")
+    print("🤖 GEMINI AI MESSAGE GENERATION - ALL 4 WAVES (HUMANIZED)")
     print("="*80)
     print(f"\n📅 Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"🔑 API Key: {api_key[:15]}...{api_key[-5:]}")
-    print(f"✅ Gemini configured successfully")
+    print(f"✅ Gemini configured successfully\n")
     
-    # Display borrower info
-    borrower = DEMO_BORROWER
-    total_due = borrower["failed_amount"] + borrower["nsf_fee"]
+    # Test all 4 waves with different borrowers
+    test_cases = [
+        {"name": "Maria Gonzalez", "failed_amount": 525.50, "nsf_fee": 50.00, "wave": 1, "reason": "EFT Failed Insufficient Funds"},
+        {"name": "John Smith", "failed_amount": 1200.00, "nsf_fee": 75.00, "wave": 2, "reason": "EFT Failed Stop Payment"},
+        {"name": "Sarah Johnson", "failed_amount": 800.00, "nsf_fee": 50.00, "wave": 3, "reason": "EFT Failed Account Closed"},
+        {"name": "Robert Chen", "failed_amount": 2500.00, "nsf_fee": 100.00, "wave": 4, "reason": "EFT Failed Insufficient Funds"},
+    ]
     
-    print(f"\n{'─'*80}")
-    print("📋 BORROWER DATA")
-    print(f"{'─'*80}")
-    print(f"  Name: {borrower['name']}")
-    print(f"  Failed Payment: ${borrower['failed_amount']:.2f}")
-    print(f"  NSF Fee: ${borrower['nsf_fee']:.2f}")
-    print(f"  Total Due: ${total_due:.2f}")
-    print(f"  Account Balance: ${borrower['balance']:.2f}")
-    print(f"  Reason: {borrower['reason']}")
-    print(f"  Wave: {borrower['wave']} (Initial Contact)")
+    results = []
     
-    # Build prompt
-    print(f"\n{'─'*80}")
-    print("🔄 GENERATING MESSAGE WITH GEMINI...")
-    print(f"{'─'*80}\n")
-    
-    prompt = f"""
-You are a professional collections agent. Generate a HUMAN-FRIENDLY, 
-CONVERSATIONAL message to {borrower['name']} about a failed payment.
-
-Details:
-- Failed Payment Amount: ${borrower['failed_amount']:.2f}
-- NSF Fee: ${borrower['nsf_fee']:.2f}
-- Total Due: ${total_due:.2f}
-- Account Balance: ${borrower['balance']:.2f}
-- Reason: {borrower['reason']}
-
-Make it sound natural and genuine - like a real person helping, not a robot.
-Keep it to 2-3 sentences. Include amounts clearly.
-Use this exact style:
-- Hi {borrower['name']}, we see that your last payment for ${borrower['failed_amount']:.2f} was stopped/failed.
-- We need ${borrower['failed_amount']:.2f} + ${borrower['nsf_fee']:.2f} NSF fee now.
-- Your current balance is ${borrower['balance']:.2f} + ${borrower['nsf_fee']:.2f} NSF fee.
-- End with: to resolve or update payment information.
-Do NOT write: "please give us a call", "please call us", or any phone instruction.
-Generate ONLY the message, no explanations.
-"""
-    
-    try:
-        # Call Gemini API
-        response = client.models.generate_content(
-            model=model,
-            contents=prompt
+    for idx, test_case in enumerate(test_cases, 1):
+        borrower = test_case["name"]
+        total_due = test_case["failed_amount"] + test_case["nsf_fee"]
+        wave = test_case["wave"]
+        
+        wave_names = {1: "Initial Contact (Friendly)", 2: "Second Notice (Firm)", 3: "Legal Escalation (Urgent)", 4: "Final Pressure (Very Urgent)"}
+        
+        print(f"\n{'='*80}")
+        print(f"WAVE {wave} - {wave_names.get(wave, 'Unknown')}")
+        print(f"{'='*80}")
+        print(f"📋 Borrower: {borrower}")
+        print(f"   Failed Payment: ${test_case['failed_amount']:.2f}")
+        print(f"   NSF Fee: ${test_case['nsf_fee']:.2f}")
+        print(f"   Total Due: ${total_due:.2f}")
+        print(f"   Reason: {test_case['reason']}")
+        
+        # Generate message
+        message = client.generate_collection_message(
+            borrower_name=borrower,
+            failed_amount=test_case["failed_amount"],
+            nsf_fee=test_case["nsf_fee"],
+            current_balance=total_due,
+            reason=test_case["reason"],
+            wave=wave,
+            tone="professional_friendly"
         )
         
-        if response.text:
-            message = response.text.strip()
-            for phrase in ["please give us a call", "please call us", "call us", "give us a call"]:
-                message = message.replace(phrase, "resolve or update payment information")
-                message = message.replace(phrase.title(), "Resolve or update payment information")
-            
-            print("✅ MESSAGE GENERATED SUCCESSFULLY:\n")
-            print("┌" + "─"*78 + "┐")
-            for line in message.split("\n"):
-                print(f"│ {line:<76} │")
-            print("└" + "─"*78 + "┘")
-            
-            print(f"\n📏 Message Length: {len(message)} characters")
-            
-            if len(message) <= 160:
-                print("✅ SMS Compatible (≤160 chars)")
-            else:
-                print(f"⚠️  SMS Limit Warning: {len(message) - 160} exceeds 160 char limit")
-            
-            # Display formatted output
-            result = {
-                "success": True,
-                "borrower": borrower['name'],
-                "total_due": total_due,
-                "wave": borrower['wave'],
-                "generated_message": message,
-                "character_count": len(message),
-                "sms_compatible": len(message) <= 160,
-                "timestamp": datetime.now().isoformat(),
-            }
-            
-            print(f"\n{'─'*80}")
-            print("📤 JSON OUTPUT:")
-            print(f"{'─'*80}")
-            print(json.dumps(result, indent=2))
-            
-            print(f"\n{'='*80}")
-            print("✅ DEMO COMPLETE - Message ready to send!")
-            print(f"{'='*80}\n")
-            
+        print(f"\n✅ MESSAGE GENERATED:\n")
+        print("┌" + "─"*78 + "┐")
+        for line in message.split("\n"):
+            print(f"│ {line:<76} │")
+        print("└" + "─"*78 + "┘")
+        
+        print(f"\n📏 Message Length: {len(message)} characters", end="")
+        if len(message) <= 160:
+            print(" ✅ SMS Compatible (≤160 chars)")
         else:
-            print("❌ No response from Gemini API")
-            
-    except Exception as e:
-        error_text = str(e)
-        error_lower = error_text.lower()
-
-        if "429" in error_lower or "resource_exhausted" in error_lower or "quota" in error_lower:
-            print(f"❌ Error: {e}")
-            print("No fallback message is generated. This output is Gemini-only.")
-            print("\nAction required:")
-            print("  1. Create/use an API key from a project with available Gemini quota")
-            print("  2. Enable billing for that project if required")
-            print("  3. Replace GEMINI_API_KEY in .env and rerun")
-            print("\nHelpful links:")
-            print("  - Quotas: https://ai.google.dev/gemini-api/docs/rate-limits")
-            print("  - Usage:  https://ai.dev/rate-limit")
-        else:
-            print(f"❌ Error: {e}")
-            print("No fallback message is generated. This output is Gemini-only.")
-            import traceback
-            traceback.print_exc()
+            print(f" ⚠️  Exceeds SMS limit by {len(message) - 160} chars")
+        
+        results.append({
+            "wave": wave,
+            "borrower": borrower,
+            "total_due": total_due,
+            "message": message,
+            "length": len(message),
+        })
+    
+    # Summary
+    print(f"\n\n{'='*80}")
+    print("📊 SUMMARY - ALL 4 WAVES")
+    print(f"{'='*80}\n")
+    
+    for result in results:
+        print(f"Wave {result['wave']} - {result['borrower']} (${result['total_due']:,.2f}) - {result['length']} chars")
+        print(f"  {result['message']}\n")
+    
+    print(f"{'='*80}")
+    print("✅ DEMO COMPLETE - All waves generated!")
+    print(f"{'='*80}\n")
 
 
 def demo_full_pipeline():
