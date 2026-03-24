@@ -129,3 +129,39 @@ class CRMIngestServiceTests(TestCase):
         self.assertEqual(report["skipped_missing_due_amount_count"], 1)
         self.assertEqual(CollectionCase.objects.count(), 0)
         self.assertEqual(TransactionLedger.objects.count(), 0)
+
+    def test_phone_object_raw_is_parsed_for_sms(self):
+        rows = [
+            {
+                "id": 12003,
+                "board_id": 70,
+                "group_id": 91,
+                "columns": {
+                    "Client": "Phone Object User",
+                    "Reason": "NSF",
+                    "Amount": "146.25",
+                    "Balance": "196.25",
+                    "Phone Number": {
+                        "raw": "+12365979585",
+                        "valid": True,
+                        "country": "CA",
+                        "formatted": "(236) 597-9585",
+                    },
+                    "Email": "phone.object@example.com",
+                    "Date": "2026-03-19",
+                },
+            }
+        ]
+        service = CRMIngestService(client=_FakeClient(rows))
+
+        report = service.sync(
+            board_ids=[70],
+            group_ids_by_board={"70": [91]},
+            dry_run=True,
+            limit=100,
+            max_pages_per_group=1,
+        )
+
+        self.assertEqual(report["totals"]["processed"], 1)
+        self.assertEqual(report["contact_quality"]["invalid_phone_count"], 0)
+        self.assertEqual(report["contact_quality"]["rows_without_sms_usable_phone"], 0)

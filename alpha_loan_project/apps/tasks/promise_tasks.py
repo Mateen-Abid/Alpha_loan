@@ -1,9 +1,15 @@
 """Promise to Pay Tasks - Commitment fulfillment tracking"""
 
+from datetime import timedelta
+import logging
+
 from celery import shared_task
 from django.utils import timezone
+
 from apps.collections.models import PaymentCommitment
-import logging
+from apps.collections.workflows.state_machine import WorkflowStateMachine
+from apps.collections.workflows.workflow_states import WorkflowActions, WorkflowState
+from apps.communications.services.communication_router import CommunicationRouter
 
 logger = logging.getLogger(__name__)
 
@@ -14,26 +20,25 @@ def check_commitment_fulfillment():
     Check if payment commitments were fulfilled.
     Mark broken commitments and trigger escalation.
     """
-    from datetime import timedelta
-    
     past_commitments = PaymentCommitment.objects.filter(
-        status__in=['PENDING', 'CONFIRMED'],
-        promised_date__lt=timezone.now().date()
+        status__in=[
+            PaymentCommitment.CommitmentStatus.PENDING,
+            PaymentCommitment.CommitmentStatus.CONFIRMED,
+        ],
+        promised_date__lt=timezone.now().date(),
     )
     
     for commitment in past_commitments:
         if commitment.amount_paid >= commitment.committed_amount:
-            commitment.status = 'FULFILLED'
+            commitment.status = PaymentCommitment.CommitmentStatus.FULFILLED
         else:
-            commitment.status = 'BROKEN'
+            commitment.status = PaymentCommitment.CommitmentStatus.BROKEN
         
         commitment.save()
         
-        if commitment.status == 'BROKEN':
+        if commitment.status == PaymentCommitment.CommitmentStatus.BROKEN:
             # Trigger workflow escalation
             case = commitment.collection_case
-            from apps.collections.workflows.workflow_states import WorkflowState, WorkflowActions
-            from apps.collections.workflows.state_machine import WorkflowStateMachine
             
             state_machine = WorkflowStateMachine(
                 WorkflowState[case.current_workflow_step]
@@ -43,19 +48,20 @@ def check_commitment_fulfillment():
                 case.current_workflow_step = state_machine.current_state.value
                 case.save()
                 
-                logger.info(f"Escalated case {case.account_id} due to broken commitment")
+                logger.info("Escalated case %s due to broken commitment", case.account_id)
 
 
 @shared_task
 def send_commitment_reminder():
     """Send reminders for upcoming commitments"""
-    from datetime import timedelta
-    from apps.communications.services.communication_router import CommunicationRouter
-    
+
     tomorrow = timezone.now().date() + timedelta(days=1)
     commitments = PaymentCommitment.objects.filter(
-        status__in=['PENDING', 'CONFIRMED'],
-        promised_date=tomorrow
+        status__in=[
+            PaymentCommitment.CommitmentStatus.PENDING,
+            PaymentCommitment.CommitmentStatus.CONFIRMED,
+        ],
+        promised_date=tomorrow,
     )
     
     router = CommunicationRouter()
@@ -66,7 +72,7 @@ def send_commitment_reminder():
         
         try:
             router.send_message(
-                channel='sms',
+                channel="sms",
                 payload={
                     "row_id": case.partner_row_id or case.account_id,
                     "case_id": case.id,
@@ -76,6 +82,6 @@ def send_commitment_reminder():
                     "subject": "Commitment Reminder",
                 },
             )
-            logger.info(f"Reminder sent for commitment {commitment.id}")
-        except Exception as e:
-            logger.error(f"Error sending reminder: {str(e)}")
+            logger.info("Reminder sent for commitment %s", commitment.id)
+        except Exception as exc:
+            logger.error("Error sending reminder: %s", str(exc))

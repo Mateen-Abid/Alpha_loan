@@ -6,6 +6,10 @@ import logging
 from typing import Optional
 
 import google.genai as genai
+from apps.ai.constants import (
+    build_gemini_collection_message_prompt,
+    build_gemini_intent_prompt,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -130,76 +134,15 @@ class GeminiClient:
         """
         Build the prompt for Gemini to generate collection message.
         """
-        wave_descriptions = {
-            1: "initial contact, friendly reminder",
-            2: "second notice, more firm",
-            3: "legal escalation, serious tone",
-            4: "final pressure, urgent action required",
-        }
-        
-        wave_desc = wave_descriptions.get(wave, "follow-up")
-        total_due = failed_amount + nsf_fee
-        
-        prompt = f"""
-You are mike or sarah, a REAL collections agent texting {first_name} casually on their phone.
-
-REQUIRED FORMAT - START YOUR MESSAGE WITH THIS:
-"hey {first_name}, this is [mike or sarah] from [company name]..."
-
-Then continue naturally. You're having a brief conversation, not sending a corporate email.
-
-Details:
-- Borrower: {first_name}
-- Failed Payment: ${failed_amount:.2f}
-- NSF Fee: ${nsf_fee:.2f}
-- Total Due: ${total_due:.2f}
-- Wave {wave}
-
-YOUR TONE (CRITICAL):
-✓ ALWAYS start: "hey {first_name}, this is [agent] from [company]..."
-✓ Pick any company name (iloans, fashloan, quickcash, loanpro, etc.) - make it realistic
-✓ Conversational and direct after the intro
-✓ Use dropped caps, contractions, casual words (gotta, wanna, gonna, etc.)
-✓ Slightly imperfect grammar = HUMAN
-✓ NO gendered casual language - NEVER say "man", "buddy", "dude", "bro"
-✓ Say things like: "we gotta figure this out", "can you send that in?", "the latest I can go is Friday"
-✓ 2-3 short casual sentences MAX (after intro)
-✗ NO formal bank language: avoid "Hi", "we see that", "to resolve", "kindly", "update payment information"
-✗ NO robotic phrases: "unsuccessful", "has declined", "current balance is"
-✗ NO excessive politeness or structure
-✗ Do not sound like a bank email AT ALL
-
-Must mention:
-- Payment bounced/failed
-- Total due amount
-- When you need it (ask for deadline)
-
-Wave guidance:
-- Wave 1: Friendly, straightforward, helpful vibe - offer to help solve problem
-- Wave 2: More direct and firm - they know they owe money, need quick payment
-- Wave 3: Urgent and serious - legal escalation territory, ASAP tone
-- Wave 4: Final pressure - URGENT, RIGHT NOW, CONSEQUENCES, no more negotiating
-
-EXAMPLES TO MATCH TONE (ALL START WITH AGENT INTRO):
-Wave 1 (Friendly): "hey {first_name}, this is mike from iloans. your payment bounced. we gotta figure this out. when can you take care of it?"
-Wave 2 (Firm): "hey {first_name}, this is sarah from fashloan. look, your payment bounced. I need ${total_due:.2f} from you. when can you send it?"
-Wave 3 (Urgent): "yo {first_name}, this is mike from quickcash. your payment bounced. we need ${total_due:.2f} ASAP. this is serious. when can you handle this?"
-Wave 4 (Final): "hey {first_name}, this is sarah from loanpro. your payment bounced. this is URGENT and FINAL - we need ${total_due:.2f} RIGHT NOW. respond immediately."
-
-WAVE {wave} SPECIFIC RULES:
-- Wave 1: Be friendly and helpful. Show you want to collaborate to fix the problem.
-- Wave 2: Still respectful but firmer. They had their chance, now need concrete timeline.
-- Wave 3: Urgent and serious. Use ASAP, serious, important. This is legal territory.
-- Wave 4: FINAL AND URGENT. Use RIGHT NOW, URGENT, FINAL, IMMEDIATE, DO NOT IGNORE.
-
-CRITICAL: 
-- EVERY message MUST start with "hey {first_name}, this is [agent] from [company]..."
-- If your response sounds like a bank wrote it, REWRITE IT. It should sound like a real person, not AI.
-
-Generate ONLY the message text. No explanations. No brackets. Just raw text like a real text message.
-"""
-        
-        return prompt.strip()
+        return build_gemini_collection_message_prompt(
+            first_name=first_name,
+            failed_amount=failed_amount,
+            nsf_fee=nsf_fee,
+            current_balance=current_balance,
+            reason=reason,
+            wave=wave,
+            tone=tone,
+        )
 
     @staticmethod
     def _build_intent_prompt(
@@ -209,34 +152,10 @@ Generate ONLY the message text. No explanations. No brackets. Just raw text like
         """
         Build the prompt for Gemini to analyze borrower intent.
         """
-        context_str = ""
-        if case_context:
-            context_str = f"\nCase Context: Amount due ${case_context.get('amount_due', 0)}, Wave {case_context.get('wave', 3)}"
-        
-        prompt = f"""
-        Analyze the borrower's message and classify their intent.{context_str}
-        
-        Borrower Message: "{borrower_message}"
-        
-        Possible intents:
-        - PROMISE_TO_PAY (borrower commits to payment)
-        - PARTIAL_PAYMENT (will pay some but not full amount)
-        - REQUEST_TIME_EXTENSION (needs more time)
-        - REQUEST_NEW_ARRANGEMENT (wants payment plan)
-        - REFUSAL (refuses to pay)
-        - DISPUTE (disputes the charge)
-        - NEEDS_INFO (requests account information)
-        - IRRELEVANT (no collection relevance)
-        - UNCLEAR (cannot determine)
-        
-        Respond ONLY in this format:
-        INTENT: [intent]
-        CONFIDENCE: [0-100]
-        SENTIMENT: [positive/neutral/negative]
-        EXPLANATION: [brief reason]
-        """
-        
-        return prompt.strip()
+        return build_gemini_intent_prompt(
+            borrower_message=borrower_message,
+            case_context=case_context,
+        )
 
     @staticmethod
     def _parse_intent_response(response_text: str) -> dict:
@@ -278,21 +197,20 @@ Generate ONLY the message text. No explanations. No brackets. Just raw text like
         Fallback message if Gemini API fails. Wave-specific escalation, no gendered language.
         """
         total_due = failed_amount + nsf_fee
-        companies = ["iLoans", "QuickCash", "LoanPro", "FastFunds", "CashFlow"]
-        company = companies[wave % len(companies)]
+        company = "ilowns"
         
         if wave == 1:
             # Friendly and helpful
             return f"hey {first_name}, this is mike from {company}. your payment bounced. we gotta figure this out. total is ${total_due:.2f}. when can you take care of it?"
         elif wave == 2:
             # More firm
-            return f"hey {first_name}, this is sarah from {company}. look, your payment bounced. I need ${total_due:.2f} from you. when can you send it?"
+            return f"hey {first_name}, this is mike from {company}. look, your payment bounced. I need ${total_due:.2f} from you. when can you send it?"
         elif wave == 3:
             # Urgent and serious
             return f"hey {first_name}, this is mike from {company}. your payment bounced. we need ${total_due:.2f} ASAP. this is serious. when can you handle this?"
         else:  # wave 4
             # Final pressure - URGENT
-            return f"hey {first_name}, this is sarah from {company}. URGENT - your payment bounced. we need ${total_due:.2f} RIGHT NOW. this is final. respond immediately."
+            return f"hey {first_name}, this is mike from {company}. URGENT - your payment bounced. we need ${total_due:.2f} RIGHT NOW. this is final. respond immediately."
 
     @staticmethod
     def _sanitize_message(message: str) -> str:

@@ -1,6 +1,12 @@
 """Message Generator - AI-powered response generation"""
 
 from apps.ai.clients import OpenAIClient
+from apps.ai.constants import (
+    build_openai_email_prompt,
+    build_openai_sms_prompt,
+    get_openai_email_system_prompt,
+    get_openai_sms_system_prompt,
+)
 from typing import Dict
 
 
@@ -20,11 +26,12 @@ class MessageGenerator:
         Returns:
             Dict with generated message
         """
-        prompt = self._build_sms_prompt(context)
+        prompt = build_openai_sms_prompt(context)
+        workflow_step = context.get('workflow_step', 'STEP_1')
         
         response = self.client.call_api(
             prompt=prompt,
-            system=self._get_sms_system_prompt(context['workflow_step']),
+            system=get_openai_sms_system_prompt(workflow_step),
             temperature=0.5
         )
         
@@ -36,11 +43,12 @@ class MessageGenerator:
     
     def generate_email(self, context: Dict) -> Dict:
         """Generate email message for borrower"""
-        prompt = self._build_email_prompt(context)
+        prompt = build_openai_email_prompt(context)
+        workflow_step = context.get('workflow_step', 'STEP_1')
         
         response = self.client.call_api(
             prompt=prompt,
-            system=self._get_email_system_prompt(context['workflow_step']),
+            system=get_openai_email_system_prompt(workflow_step),
             temperature=0.5
         )
         
@@ -50,32 +58,3 @@ class MessageGenerator:
             'status': response.get('status'),
             'error': response.get('error')
         }
-    
-    def _build_sms_prompt(self, context: Dict) -> str:
-        return f"""Generate a professional SMS collection message:
-- Amount due: ${context.get('amount_due', 0)}
-- Workflow step: {context.get('workflow_step', 'STEP_1')}
-- Account age: {context.get('days_delinquent', 0)} days
-
-Message should be concise (160 chars max) and professional."""
-    
-    def _build_email_prompt(self, context: Dict) -> str:
-        return f"""Generate a professional collection email:
-- Amount due: ${context.get('amount_due', 0)}
-- Workflow step: {context.get('workflow_step', 'STEP_1')}
-- Borrower name: {context.get('borrower_name', 'Valued Client')}
-
-Email should be professional and include action items."""
-    
-    def _get_sms_system_prompt(self, step: str) -> str:
-        messages = {
-            'STEP_1': 'Be courteous and professional. This is the initial contact.',
-            'STEP_2': 'Be urgent but professional. This is a follow-up.',
-            'STEP_3': 'Be firm and direct. Mention NSF fees.',
-            'STEP_4': 'Be serious. Emphasize payment is critical.',
-            'FINAL_PRESSURE': 'Be final and decisive. Final notice.'
-        }
-        return messages.get(step, 'Be professional.')
-    
-    def _get_email_system_prompt(self, step: str) -> str:
-        return f"Write a {step} collection email. Keep it professional but firm."

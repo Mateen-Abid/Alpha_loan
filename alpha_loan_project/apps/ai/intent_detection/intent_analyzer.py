@@ -2,25 +2,15 @@
 
 from . import BorrowerIntent
 from apps.ai.clients import OpenAIClient
+from apps.ai.constants import (
+    OPENAI_INTENT_ANALYZER_SYSTEM_PROMPT,
+    build_openai_intent_user_prompt,
+)
 from typing import Dict, Tuple
 
 
 class IntentAnalyzer:
     """Analyzes borrower messages to detect intent"""
-    
-    SYSTEM_PROMPT = """You are an AI assistant analyzing loan collection communications.
-    
-Classify the borrower's message into one of these intents:
-- promise_to_pay: Borrower commits to pay
-- refusal: Borrower refuses to pay
-- request_info: Borrower asking for information
-- dispute: Borrower disputes the debt
-- hardship: Borrower claims financial hardship
-- payment_made: Borrower indicates payment was made
-- callback_request: Borrower requests callback
-- unknown: Cannot determine intent
-
-Respond with JSON: {"intent": "intent_name", "confidence": 0.0-1.0, "summary": "brief summary"}"""
     
     def __init__(self):
         self.client = OpenAIClient()
@@ -35,11 +25,11 @@ Respond with JSON: {"intent": "intent_name", "confidence": 0.0-1.0, "summary": "
         Returns:
             Dict with intent, confidence, and summary
         """
-        prompt = f"Classify this borrower message: {message}"
+        prompt = build_openai_intent_user_prompt(message)
         
         response = self.client.call_api(
             prompt=prompt,
-            system=self.SYSTEM_PROMPT,
+            system=OPENAI_INTENT_ANALYZER_SYSTEM_PROMPT,
             temperature=0.3  # Low randomness for classification
         )
         

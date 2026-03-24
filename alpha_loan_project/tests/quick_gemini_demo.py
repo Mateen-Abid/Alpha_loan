@@ -11,7 +11,7 @@ USAGE:
        Windows: $env:GEMINI_API_KEY='your_key'
        Linux/Mac: export GEMINI_API_KEY='your_key'
      3. Install dependency:
-         pip install google.genai
+         pip install google-genai
     4. Run this script:
        python tests/quick_gemini_demo.py
 """
@@ -64,7 +64,7 @@ def demo_message_generation():
         print("     $env:GEMINI_API_KEY='your_key_here'")
         print("\n     Linux/Mac:")
         print("     export GEMINI_API_KEY='your_key_here'")
-        print("\n  3. Install: pip install google.genai")
+        print("\n  3. Install: pip install google-genai")
         print("  4. Run: python tests/quick_gemini_demo.py")
         return
     
@@ -73,7 +73,7 @@ def demo_message_generation():
         client = GeminiClient(api_key=api_key)
     except ImportError:
         print("\n❌ Missing google.genai")
-        print("   Install with: pip install google.genai")
+        print("   Install with: pip install google-genai")
         return
     
     # Display demo header
@@ -163,14 +163,7 @@ def demo_full_pipeline():
         demo_message_generation()
         return
     
-    try:
-        import google.genai as genai
-    except ImportError:
-        print("\n❌ Missing dependency: pip install google.genai")
-        return
-    
-    client = genai.Client(api_key=api_key)
-    model = "gemini-2.5-flash"
+    client = GeminiClient(api_key=api_key)
     
     # All 5 borrowers
     borrowers = [
@@ -192,34 +185,24 @@ def demo_full_pipeline():
         total_due = borrower["amount"] + nsf_fee
         
         print(f"\n[{idx}/5] {borrower['name']} (Wave {borrower['wave']})...")
-        
-        prompt = f"""
-Generate a natural collection message for {borrower['name']} about a ${borrower['amount']:.2f} 
-failed payment. They owe ${total_due:.2f} total (includes $50 NSF fee). 
-Wave {borrower['wave']}: {'friendly reminder' if borrower['wave'] == 1 else 'firm notice' if borrower['wave'] == 2 else 'serious' if borrower['wave'] == 3 else 'urgent final notice'}.
-Keep it 2-3 sentences, conversational, genuine. Message only, no explanation.
-Do NOT write phone instructions. End with: to resolve or update payment information.
-"""
-        
+
         try:
-            response = client.models.generate_content(
-                model=model,
-                contents=prompt
+            message = client.generate_collection_message(
+                borrower_name=borrower["name"],
+                failed_amount=borrower["amount"],
+                nsf_fee=nsf_fee,
+                current_balance=borrower["balance"],
+                reason=borrower["reason"],
+                wave=borrower["wave"],
+                tone="professional_friendly",
             )
-            if response.text:
-                message = response.text.strip()
-                for phrase in ["please give us a call", "please call us", "call us", "give us a call"]:
-                    message = message.replace(phrase, "resolve or update payment information")
-                    message = message.replace(phrase.title(), "Resolve or update payment information")
-                results.append({
-                    "borrower": borrower['name'],
-                    "wave": borrower['wave'],
-                    "total_due": total_due,
-                    "message": message,
-                })
-                print(f"   ✅ Generated ({len(message)} chars)")
-            else:
-                print(f"   ❌ No response")
+            results.append({
+                "borrower": borrower['name'],
+                "wave": borrower['wave'],
+                "total_due": total_due,
+                "message": message,
+            })
+            print(f"   ✅ Generated ({len(message)} chars)")
         except Exception as e:
             print(f"   ❌ Error: {e}")
     

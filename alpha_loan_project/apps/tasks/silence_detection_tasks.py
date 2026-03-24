@@ -1,9 +1,12 @@
 """Silence Detection Tasks - Track contact attempts"""
 
+from datetime import timedelta
+import logging
+
 from celery import shared_task
 from django.utils import timezone
-from apps.collections.models import CollectionCase, InteractionLedger
-import logging
+
+from apps.collections.models import CollectionCase
 
 logger = logging.getLogger(__name__)
 
@@ -14,18 +17,20 @@ def detect_silence_periods():
     Detect cases with no recent contact and flag them.
     Triggers additional outreach for silent borrowers.
     """
-    from datetime import timedelta
-    
     silence_threshold = timezone.now() - timedelta(days=7)
     
     silent_cases = CollectionCase.objects.filter(
-        status='ACTIVE',
-        last_contact_at__lte=silence_threshold
+        status=CollectionCase.CollectionStatus.ACTIVE,
+        last_contact_at__lte=silence_threshold,
     )
     
     for case in silent_cases:
         # Flag for manual review or escalated outreach
-        logger.warning(f"Silence detected on case {case.account_id} - last contact {case.last_contact_at}")
+        logger.warning(
+            "Silence detected on case %s - last contact %s",
+            case.account_id,
+            case.last_contact_at,
+        )
         
         # Could trigger escalated collection attempts
         attempt_escalated_contact.delay(case.id)
@@ -38,13 +43,13 @@ def attempt_escalated_contact(case_id: int):
         case = CollectionCase.objects.get(id=case_id)
         
         from apps.communications.services.communication_router import CommunicationRouter
+
         router = CommunicationRouter()
-        
-        message = f"Important: Your account requires immediate attention. Please contact us."
+        message = "Important: Your account requires immediate attention. Please contact us."
         
         # Try SMS first
         router.send_message(
-            channel='sms',
+            channel="sms",
             payload={
                 "row_id": case.partner_row_id or case.account_id,
                 "case_id": case.id,
@@ -58,7 +63,7 @@ def attempt_escalated_contact(case_id: int):
         # If email exists, also send email
         if case.borrower_email:
             router.send_message(
-                channel='email',
+                channel="email",
                 payload={
                     "row_id": case.partner_row_id or case.account_id,
                     "case_id": case.id,
@@ -69,6 +74,6 @@ def attempt_escalated_contact(case_id: int):
                 },
             )
         
-        logger.info(f"Escalated contact attempted for case {case.account_id}")
-    except Exception as e:
-        logger.error(f"Error in escalated contact: {str(e)}")
+        logger.info("Escalated contact attempted for case %s", case.account_id)
+    except Exception as exc:
+        logger.error("Error in escalated contact: %s", str(exc))

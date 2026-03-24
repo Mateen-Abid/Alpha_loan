@@ -28,6 +28,28 @@ def _build_case_context(case: CollectionCase) -> Dict[str, object]:
     }
 
 
+def _build_dispatch_payload(
+    case: CollectionCase,
+    message: str,
+    *,
+    subject: str,
+    ai_generated: bool,
+) -> Dict[str, object]:
+    return {
+        "row_id": case.partner_row_id or case.account_id,
+        "case_id": case.id,
+        "phone": case.borrower_phone,
+        "email": case.borrower_email,
+        "message": message,
+        "subject": subject,
+        "ai_generated": ai_generated,
+    }
+
+
+def _select_outbound_channel(case: CollectionCase) -> str:
+    return "sms" if case.borrower_phone else "email"
+
+
 @shared_task(bind=True, autoretry_for=(ExternalDispatchError,), retry_backoff=True, retry_jitter=True, max_retries=5)
 def send_followup_messages(self):
     """
@@ -61,16 +83,13 @@ def send_followup_messages(self):
                 logger.info("Skipping duplicate follow-up dispatch for case %s", case.account_id)
                 continue
 
-            payload = {
-                "row_id": case.partner_row_id or case.account_id,
-                "case_id": case.id,
-                "phone": case.borrower_phone,
-                "email": case.borrower_email,
-                "message": message,
-                "subject": "Collection Reminder",
-                "ai_generated": bool(ai_message.get("status") == "success"),
-            }
-            channel = "sms" if case.borrower_phone else "email"
+            payload = _build_dispatch_payload(
+                case,
+                message,
+                subject="Collection Reminder",
+                ai_generated=bool(ai_message.get("status") == "success"),
+            )
+            channel = _select_outbound_channel(case)
             router.send_message(channel=channel, payload=payload)
 
             next_run = timezone.now() + timedelta(days=3)
@@ -79,9 +98,9 @@ def send_followup_messages(self):
             case.last_contact_at = timezone.now()
             case.save(update_fields=["next_action_time", "next_followup_at", "last_contact_at", "updated_at"])
 
-            logger.info(f"Follow-up message sent for case {case.account_id}")
-        except Exception as e:
-            logger.error(f"Error sending follow-up for case {case.account_id}: {str(e)}")
+            logger.info("Follow-up message sent for case %s", case.account_id)
+        except Exception as exc:
+            logger.error("Error sending follow-up for case %s: %s", case.account_id, str(exc))
             raise
 
 
@@ -123,7 +142,10 @@ def process_borrower_message(self, case_id: int, interaction_id: int, message: s
                 collection_case=case,
                 committed_amount=case.get_remaining_balance(),
                 promised_date=promised_date,
-                status__in=["PENDING", "CONFIRMED"],
+                status__in=[
+                    PaymentCommitment.CommitmentStatus.PENDING,
+                    PaymentCommitment.CommitmentStatus.CONFIRMED,
+                ],
             ).exists()
             if not exists:
                 CollectionService.create_payment_commitment(
@@ -153,22 +175,19 @@ def process_borrower_message(self, case_id: int, interaction_id: int, message: s
         suggested_message = suggested.get("message")
         if suggested_message:
             router = CommunicationRouter()
-            payload = {
-                "row_id": case.partner_row_id or case.account_id,
-                "case_id": case.id,
-                "phone": case.borrower_phone,
-                "email": case.borrower_email,
-                "message": suggested_message,
-                "subject": "Account Update",
-                "ai_generated": True,
-            }
-            outbound_channel = "sms" if case.borrower_phone else "email"
+            payload = _build_dispatch_payload(
+                case,
+                suggested_message,
+                subject="Account Update",
+                ai_generated=True,
+            )
+            outbound_channel = _select_outbound_channel(case)
             router.send_message(outbound_channel, payload)
 
-        logger.info(f"Processed message for case {case.account_id}, intent: {intent}")
+        logger.info("Processed message for case %s, intent: %s", case.account_id, intent)
         return {"status": "success", "intent": intent}
-    except Exception as e:
-        logger.error(f"Error processing borrowed message: {str(e)}")
+    except Exception as exc:
+        logger.error("Error processing borrower message: %s", str(exc))
         raise
 
 
@@ -188,8 +207,8 @@ def process_voice_transcript(self, case_id: int, interaction_id: int, transcript
             return {"status": "success", "idempotent": True}
 
         process_borrower_message.run(case_id=case.id, interaction_id=interaction.id, message=transcript, channel="voice")
-        logger.info(f"Processed voice transcript for case {case.account_id}")
+        logger.info("Processed voice transcript for case %s", case.account_id)
         return {"status": "success"}
-    except Exception as e:
-        logger.error(f"Error processing voice transcript: {str(e)}")
+    except Exception as exc:
+        logger.error("Error processing voice transcript: %s", str(exc))
         raise

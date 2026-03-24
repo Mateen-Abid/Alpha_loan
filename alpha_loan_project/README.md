@@ -22,6 +22,7 @@ alpha_loan_project/
 │   │   ├── development.py          # Dev settings
 │   │   ├── production.py           # Production settings
 │   │   └── test.py                 # Test settings
+│   ├── celery.py                   # Celery app + beat schedule
 │   ├── urls.py
 │   └── wsgi.py
 │
@@ -69,7 +70,8 @@ alpha_loan_project/
 │   │   │   └── intent_types.py
 │   │   ├── message_generation/
 │   │   │   ├── message_generator.py
-│   │   │   └── prompt_templates.py
+│   │   │   └── gemini_message_generator.py
+│   │   ├── constants.py            # Central AI prompt definitions
 │   │   ├── services/
 │   │   │   └── ai_orchestrator.py
 │   │   ├── views/
@@ -94,8 +96,7 @@ alpha_loan_project/
 │   ├── tasks/                      # Background jobs
 │   │   ├── followup_tasks.py
 │   │   ├── promise_tasks.py
-│   │   ├── silence_detection_tasks.py
-│   │   └── config.py              # Celery configuration
+│   │   └── silence_detection_tasks.py
 │   │
 │   └── core/                       # Shared utilities
 │       ├── constants/

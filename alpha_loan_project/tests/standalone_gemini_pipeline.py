@@ -16,7 +16,12 @@ import os
 import sys
 import json
 from datetime import datetime
-from decimal import Decimal as D
+
+# Ensure project-root imports (e.g. `apps.*`) work when this file
+# is executed directly via `python tests/standalone_gemini_pipeline.py`.
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
 
 # Fix Windows encoding issues with Unicode characters
 if sys.platform == "win32":
@@ -76,6 +81,7 @@ TEST_BORROWERS = [
 
 
 def generate_message_with_gemini(
+    client,
     borrower_name: str,
     failed_amount: float,
     nsf_fee: float = 50.00,
@@ -83,88 +89,15 @@ def generate_message_with_gemini(
     reason: str = "Payment failed",
     wave: int = 1,
 ) -> str:
-    """Generate a message using Gemini API."""
-    
-    import google.genai as genai
-    
-    api_key = os.getenv("GEMINI_API_KEY")
-    if not api_key:
-        # Fallback if no API key
-        return (
-            f"Hi {borrower_name}, we see that your last payment of ${failed_amount:.2f} "
-            f"failed to process. Please contact us to resolve this. Thank you."
-        )
-    
-    wave_descriptions = {
-        1: "initial contact, friendly reminder",
-        2: "second notice, more firm",
-        3: "legal escalation, serious tone",
-        4: "final pressure, urgent action required",
-    }
-    
-    wave_desc = wave_descriptions.get(wave, "follow-up")
-    tone_map = {
-        1: "professional_friendly",
-        2: "professional_firm",
-        3: "serious",
-        4: "urgent",
-    }
-    tone = tone_map.get(wave, "professional_friendly")
-    total_due = failed_amount + nsf_fee
-    
-    prompt = f"""
-You are a professional collections agent for a lending company. 
-Generate a HUMAN-FRIENDLY, CONVERSATIONAL collection message based on these details:
-
-Borrower Name: {borrower_name}
-Failed Payment Amount: ${failed_amount:.2f}
-NSF Fee: ${nsf_fee:.2f}
-Total Due Now: ${total_due:.2f}
-Current Account Balance: ${current_balance:.2f}
-Reason: {reason}
-Escalation Level: Wave {wave} ({wave_desc})
-Message Tone: {tone}
-
-Requirements:
-- Keep it friendly but firm based on escalation level
-- Make it sound natural, like from a real person, not a robot
-- Include the amounts in a clear way
-- Use this structure:
-    Hi {borrower_name}, we see that your last payment for ${failed_amount:.2f} was stopped/failed.
-    We need ${failed_amount:.2f} + ${nsf_fee:.2f} NSF fee now.
-    Your current balance is ${current_balance:.2f} + ${nsf_fee:.2f} NSF fee.
-    End with: to resolve or update payment information.
-- Do NOT write: "please give us a call", "please call us", or any phone instruction
-- Do NOT use excessive formality or legal jargon
-- Do NOT be threatening or aggressive
-- Maximum 3 sentences for SMS-friendly length
-- If it's wave 1-2, be helpful and understanding
-- If it's wave 3-4, be more serious but still respectful
-
-Generate ONLY the message text, no explanations or markdown.
-"""
-    
-    try:
-        client = genai.Client(api_key=api_key)
-        response = client.models.generate_content(
-            model="gemini-2.5-flash",
-            contents=prompt
-        )
-        
-        if response.text:
-            message = response.text.strip()
-            for phrase in ["please give us a call", "please call us", "call us", "give us a call"]:
-                message = message.replace(phrase, "resolve or update payment information")
-                message = message.replace(phrase.title(), "Resolve or update payment information")
-            return message
-    except Exception as e:
-        print(f"  [Warning] Gemini API error: {e}")
-    
-    # Fallback message
-    return (
-        f"Hi {borrower_name}, we see that your last payment for ${failed_amount:.2f} was stopped/failed. "
-        f"We need ${failed_amount:.2f} + ${nsf_fee:.2f} NSF fee now. "
-        f"Your current balance is ${total_due:.2f}. To resolve or update payment information, complete payment today."
+    """Generate message through shared runtime GeminiClient."""
+    return client.generate_collection_message(
+        borrower_name=borrower_name,
+        failed_amount=failed_amount,
+        nsf_fee=nsf_fee,
+        current_balance=current_balance,
+        reason=reason,
+        wave=wave,
+        tone="professional_friendly",
     )
 
 
@@ -178,8 +111,9 @@ def run_testing_pipeline():
         print("   Set it with: export GEMINI_API_KEY='your_key_here'")
         sys.exit(1)
     
-    # Configure Gemini
-    import google.genai as genai
+    # Configure Gemini via shared runtime client
+    from apps.ai.clients.gemini_client import GeminiClient
+    gemini_client = GeminiClient(api_key=api_key)
     
     print("\n" + "="*90)
     print("🤖 GEMINI AI MESSAGE GENERATION TESTING PIPELINE")
@@ -213,6 +147,7 @@ def run_testing_pipeline():
         print(f"\n  🔄 Generating message with Gemini...")
         try:
             message = generate_message_with_gemini(
+                client=gemini_client,
                 borrower_name=borrower['name'],
                 failed_amount=borrower['amount'],
                 nsf_fee=nsf_fee,
@@ -297,8 +232,12 @@ if __name__ == "__main__":
     try:
         run_testing_pipeline()
     except ImportError as e:
-        print(f"\n❌ Missing dependency: {e}")
-        print("   Install with: pip install google-generativeai")
+        print(f"\n❌ Import error: {e}")
+        if "No module named 'apps'" in str(e):
+            print("   Project imports are unavailable.")
+            print("   Run from project root with: python -m tests.standalone_gemini_pipeline")
+        else:
+            print("   Install with: pip install google-genai")
         sys.exit(1)
     except Exception as e:
         print(f"\n❌ Error: {e}")

@@ -449,10 +449,11 @@ class CRMIngestService:
             if raw is None:
                 continue
             if isinstance(raw, dict):
-                if "label" in raw and raw.get("label") is not None:
-                    return str(raw["label"]).strip()
-                if "text" in raw and raw.get("text") is not None:
-                    return str(raw["text"]).strip()
+                # Phone and provider payloads often store primary value in `raw`.
+                for key in ("raw", "value", "formatted", "label", "text", "name"):
+                    if key in raw and raw.get(key) not in (None, ""):
+                        return str(raw[key]).strip()
+                return str(raw).strip()
             if isinstance(raw, (list, tuple)):
                 return ", ".join(str(item).strip() for item in raw if str(item).strip())
             return str(raw).strip()
