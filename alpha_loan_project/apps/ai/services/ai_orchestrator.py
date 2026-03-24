@@ -24,7 +24,7 @@ class AIOrchestrator:
             Dict with intent detection and suggested response
         """
         # Detect intent
-        intent_result = self.intent_analyzer.analyze_message(message)
+        intent_result = self.intent_analyzer.analyze_message(message, case_context=case)
         
         # Generate response based on intent and workflow step
         context = {
@@ -32,7 +32,10 @@ class AIOrchestrator:
             'workflow_step': case.get('current_workflow_step'),
             'days_delinquent': case.get('days_delinquent'),
             'borrower_name': case.get('borrower_name'),
-            'detected_intent': intent_result.get('intent')
+            'detected_intent': intent_result.get('intent'),
+            'conversation_memory': case.get('conversation_memory'),
+            'prior_loan_history': case.get('prior_loan_history'),
+            'policy_flags': case.get('policy_flags'),
         }
         
         response = self.message_generator.generate_sms(context)
@@ -59,7 +62,10 @@ class AIOrchestrator:
             'amount_due': case.get('total_due'),
             'workflow_step': case.get('current_workflow_step'),
             'days_delinquent': case.get('days_delinquent'),
-            'borrower_name': case.get('borrower_name')
+            'borrower_name': case.get('borrower_name'),
+            'conversation_memory': case.get('conversation_memory'),
+            'prior_loan_history': case.get('prior_loan_history'),
+            'policy_flags': case.get('policy_flags'),
         }
         
         if channel == 'sms':

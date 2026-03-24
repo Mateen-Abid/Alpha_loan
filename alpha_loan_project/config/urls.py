@@ -5,8 +5,11 @@ from django.urls import path, include
 from django.conf import settings
 from django.conf.urls.static import static
 from drf_spectacular.views import SpectacularAPIView, SpectacularSwaggerView, SpectacularRedocView
+from apps.core.views.superadmin_dashboard import superadmin_dashboard, superadmin_dashboard_execute
 
 urlpatterns = [
+    path('admin/superadmin-dashboard/', superadmin_dashboard, name='superadmin_dashboard'),
+    path('admin/superadmin-dashboard/execute/', superadmin_dashboard_execute, name='superadmin_dashboard_execute'),
     path('admin/', admin.site.urls),
     
     # API Schema & Documentation

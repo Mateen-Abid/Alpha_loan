@@ -6,7 +6,7 @@ from apps.ai.constants import (
     OPENAI_INTENT_ANALYZER_SYSTEM_PROMPT,
     build_openai_intent_user_prompt,
 )
-from typing import Dict, Tuple
+from typing import Dict, Optional
 
 
 class IntentAnalyzer:
@@ -15,7 +15,7 @@ class IntentAnalyzer:
     def __init__(self):
         self.client = OpenAIClient()
     
-    def analyze_message(self, message: str) -> Dict:
+    def analyze_message(self, message: str, case_context: Optional[Dict[str, object]] = None) -> Dict:
         """
         Analyze borrower message for intent.
         
@@ -25,7 +25,7 @@ class IntentAnalyzer:
         Returns:
             Dict with intent, confidence, and summary
         """
-        prompt = build_openai_intent_user_prompt(message)
+        prompt = build_openai_intent_user_prompt(message, case_context=case_context)
         
         response = self.client.call_api(
             prompt=prompt,

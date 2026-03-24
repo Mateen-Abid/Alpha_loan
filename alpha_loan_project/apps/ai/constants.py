@@ -24,9 +24,21 @@ Classify the borrower's message into one of these intents:
 Respond with JSON: {"intent": "intent_name", "confidence": 0.0-1.0, "summary": "brief summary"}"""
 
 
-def build_openai_intent_user_prompt(message: str) -> str:
+def build_openai_intent_user_prompt(message: str, case_context: Optional[Dict[str, object]] = None) -> str:
     """Build user prompt for OpenAI intent classification."""
-    return f"Classify this borrower message: {message}"
+    context_lines: list[str] = []
+    if case_context:
+        if case_context.get("amount_due") is not None:
+            context_lines.append(f"- Amount due: ${case_context.get('amount_due')}")
+        if case_context.get("workflow_step"):
+            context_lines.append(f"- Workflow step: {case_context.get('workflow_step')}")
+        if case_context.get("conversation_memory"):
+            context_lines.append(f"- Recent conversation:\n{case_context.get('conversation_memory')}")
+        if case_context.get("prior_loan_history"):
+            context_lines.append(f"- Prior loan history:\n{case_context.get('prior_loan_history')}")
+
+    context_block = f"\nContext:\n" + "\n".join(context_lines) if context_lines else ""
+    return f"Classify this borrower message: {message}{context_block}"
 
 
 OPENAI_SMS_SYSTEM_PROMPTS = {
@@ -46,20 +58,45 @@ def get_openai_sms_system_prompt(step: str) -> str:
 
 def build_openai_sms_prompt(context: Dict[str, object]) -> str:
     """Build OpenAI SMS user prompt from case context."""
+    memory = context.get('conversation_memory') or "No recent interaction memory available."
+    history = context.get('prior_loan_history') or "No prior loan history available."
+    policy = context.get('policy_flags') or {}
+    policy_text = (
+        f"contract_breach_language_allowed={policy.get('allow_contract_breach_language', True)}, "
+        f"reference_escalation_allowed={policy.get('allow_reference_escalation', False)}"
+    )
     return f"""Generate a professional SMS collection message:
 - Amount due: ${context.get('amount_due', 0)}
 - Workflow step: {context.get('workflow_step', 'STEP_1')}
 - Account age: {context.get('days_delinquent', 0)} days
+- Borrower name: {context.get('borrower_name', 'Client')}
+- Recent conversation memory:
+{memory}
+- Prior loan history summary:
+{history}
+- Policy flags: {policy_text}
 
 Message should be concise (160 chars max) and professional."""
 
 
 def build_openai_email_prompt(context: Dict[str, object]) -> str:
     """Build OpenAI email user prompt from case context."""
+    memory = context.get('conversation_memory') or "No recent interaction memory available."
+    history = context.get('prior_loan_history') or "No prior loan history available."
+    policy = context.get('policy_flags') or {}
+    policy_text = (
+        f"contract_breach_language_allowed={policy.get('allow_contract_breach_language', True)}, "
+        f"reference_escalation_allowed={policy.get('allow_reference_escalation', False)}"
+    )
     return f"""Generate a professional collection email:
 - Amount due: ${context.get('amount_due', 0)}
 - Workflow step: {context.get('workflow_step', 'STEP_1')}
 - Borrower name: {context.get('borrower_name', 'Valued Client')}
+- Recent conversation memory:
+{memory}
+- Prior loan history summary:
+{history}
+- Policy flags: {policy_text}
 
 Email should be professional and include action items."""
 

@@ -18,7 +18,7 @@ app.autodiscover_tasks()
 app.conf.beat_schedule = {
     "send-followup-messages": {
         "task": "apps.tasks.followup_tasks.send_followup_messages",
-        "schedule": crontab(hour="9-17", minute="*/30"),
+        "schedule": crontab(hour="8-20", minute="0"),
     },
     "check-commitment-fulfillment": {
         "task": "apps.tasks.promise_tasks.check_commitment_fulfillment",

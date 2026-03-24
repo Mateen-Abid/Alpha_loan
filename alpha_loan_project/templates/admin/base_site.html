@@ -1,0 +1,18 @@
+{% extends "admin/base.html" %}
+
+{% block title %}
+{% if subtitle %}{{ subtitle }} | {% endif %}{{ title }} | {{ site_title|default:_('Django site admin') }}
+{% endblock %}
+
+{% block branding %}
+<h1 id="site-name">
+  <a href="{% url 'admin:index' %}">{{ site_header|default:_('Django administration') }}</a>
+</h1>
+{% endblock %}
+
+{% block userlinks %}
+{{ block.super }}
+{% if user.is_active and user.is_superuser %}
+  / <a href="{% url 'superadmin_dashboard' %}">Dashboard</a>
+{% endif %}
+{% endblock %}

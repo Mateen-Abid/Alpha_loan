@@ -34,6 +34,7 @@ class SyncReport:
     errors: int = 0
     missing_due_amount_count: int = 0
     skipped_missing_due_amount_count: int = 0
+    zero_due_amount_count: int = 0
     missing_phone_count: int = 0
     invalid_phone_count: int = 0
     missing_email_count: int = 0
@@ -58,6 +59,7 @@ class SyncReport:
             "reason_counts": self.reason_counts,
             "missing_due_amount_count": self.missing_due_amount_count,
             "skipped_missing_due_amount_count": self.skipped_missing_due_amount_count,
+            "zero_due_amount_count": self.zero_due_amount_count,
             "contact_quality": {
                 "missing_phone_count": self.missing_phone_count,
                 "invalid_phone_count": self.invalid_phone_count,
@@ -92,6 +94,7 @@ class CRMIngestService:
         "account frozen": "ACCOUNT_FROZEN",
         "account freezed": "ACCOUNT_FROZEN",
         "frozen account": "ACCOUNT_FROZEN",
+        "eft failed frozen account": "EFT_FAILED_FROZEN_ACCOUNT",
         "nsf": "NSF",
         "1nsf": "NSF_1",
         "first nsf": "NSF_1",
@@ -105,9 +108,13 @@ class CRMIngestService:
         "eft failed stop payment": "STOP_PMT",
         "stop_pmt": "STOP_PMT",
         "stop payment": "STOP_PMT",
+        "payment stopped recalled": "PAYMENT_STOPPED_RECALLED",
+        "eft failed no debit allowed": "EFT_FAILED_NO_DEBIT_ALLOWED",
+        "eft failed refused no agreement": "EFT_FAILED_REFUSED_NO_AGREEMENT",
         "closed acc": "CLOSED_ACC",
         "closed account": "CLOSED_ACC",
         "eft failed insufficient funds": "NSF_EFT_INSUFFICIENT_FUNDS",
+        "unknown reason": "UNKNOWN_REASON",
     }
     NSF_LIKE_CODES = {
         "NSF",
@@ -241,6 +248,8 @@ class CRMIngestService:
                     }
                 )
             return
+        if due_amount == Decimal("0.00"):
+            report.zero_due_amount_count += 1
 
         immediate_due_with_fee = due_amount + self.FEE_AMOUNT
 
@@ -269,11 +278,9 @@ class CRMIngestService:
         report.per_group_distribution[group_key] = report.per_group_distribution.get(group_key, 0) + 1
 
         if dry_run:
-            exists = CollectionCase.objects.filter(partner_row_id=row_id).exists()
-            if exists:
-                report.updated += 1
-            else:
-                report.created += 1
+            # Dry-run must never depend on DB tables/migrations.
+            # We count rows as would-be processed records only.
+            report.created += 1
             return
 
         with transaction.atomic():
@@ -450,10 +457,12 @@ class CRMIngestService:
                 continue
             if isinstance(raw, dict):
                 # Phone and provider payloads often store primary value in `raw`.
+                if not raw:
+                    return None
                 for key in ("raw", "value", "formatted", "label", "text", "name"):
                     if key in raw and raw.get(key) not in (None, ""):
                         return str(raw[key]).strip()
-                return str(raw).strip()
+                return None
             if isinstance(raw, (list, tuple)):
                 return ", ".join(str(item).strip() for item in raw if str(item).strip())
             return str(raw).strip()
