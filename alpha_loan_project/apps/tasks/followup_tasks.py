@@ -134,11 +134,24 @@ def _apply_risk_policy(message: str) -> str:
 
 
 def _build_case_context(case: CollectionCase) -> Dict[str, object]:
+    meta = _extract_meta(case)
+    proposal_level = int(meta.get("proposal_level", "1")) if meta.get("proposal_level", "1").isdigit() else 1
+    no_reply_count = int(meta.get("no_reply_count", "0")) if meta.get("no_reply_count", "0").isdigit() else 0
+    reason_code = meta.get("ingest_reason_code", "")
+    nsf_count_text = (meta.get("raw_reason", "") + " " + (meta.get("raw_comment", ""))).lower()
+    nsf_band = "1_2_nsf"
+    if "3rd" in nsf_count_text or "4nsf" in nsf_count_text or "5nsf" in nsf_count_text or "6nsf" in nsf_count_text:
+        nsf_band = "3_plus_nsf"
+
     return {
         "total_due": case.total_due,
         "current_workflow_step": case.current_workflow_step,
         "days_delinquent": case.get_age_in_days(),
         "borrower_name": case.borrower_name,
+        "reason_code": reason_code,
+        "proposal_level": proposal_level,
+        "no_reply_count": no_reply_count,
+        "nsf_band": nsf_band,
         "conversation_memory": _build_conversation_memory(case),
         "prior_loan_history": _build_prior_loan_history(case),
         "policy_flags": _policy_flags(),

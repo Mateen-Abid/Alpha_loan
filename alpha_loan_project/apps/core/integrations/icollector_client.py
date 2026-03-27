@@ -146,6 +146,16 @@ class ICollectorClient:
                 timeout=timeout,
             )
             response.raise_for_status()
+        except requests.exceptions.HTTPError as exc:
+            detail = ""
+            try:
+                payload = response.json()  # type: ignore[name-defined]
+                detail = payload.get("detail") or payload.get("error") or payload.get("code") or ""
+            except Exception:
+                detail = (response.text or "").strip()[:300] if "response" in locals() else ""
+            logger.exception("iCollector HTTP error: %s %s", method, path)
+            suffix = f" | detail={detail}" if detail else ""
+            raise ICollectorClientError(f"{exc}{suffix}") from exc
         except requests.exceptions.RequestException as exc:
             logger.exception("iCollector request failed: %s %s", method, path)
             raise ICollectorClientError(str(exc)) from exc
@@ -287,6 +297,28 @@ class ICollectorClient:
         return self.request(
             "POST",
             f"/api/partner-gateway/v1/crm/row/{row_id}/move/",
+            body=payload,
+        )
+
+    def generate_collection_llm(
+        self,
+        *,
+        prompt: str,
+        temperature: float = 0.2,
+        max_new_tokens: int = 256,
+        idempotency_key: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        payload: Dict[str, Any] = {
+            "purpose": "collection",
+            "prompt": prompt,
+            "temperature": max(0.0, min(1.5, float(temperature))),
+            "max_new_tokens": max(1, min(1024, int(max_new_tokens))),
+        }
+        if idempotency_key:
+            payload["idempotency_key"] = idempotency_key[:128]
+        return self.request(
+            "POST",
+            "/api/partner-gateway/v1/collections/llm/generate/",
             body=payload,
         )
 

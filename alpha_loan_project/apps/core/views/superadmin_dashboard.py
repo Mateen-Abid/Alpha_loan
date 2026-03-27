@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import os
 import re
 from typing import Dict
 
@@ -12,7 +11,6 @@ from django.http import JsonResponse
 from django.shortcuts import render
 from django.views.decorators.http import require_POST
 
-from apps.ai.message_generation.gemini_message_generator import GeminiMessageGenerator
 from apps.core.integrations import ICollectorClient, ICollectorClientError
 from apps.core.services.ingest_service import CRMIngestService
 
@@ -68,6 +66,19 @@ def _normalize_row_for_preview(row: Dict[str, object], ingest: CRMIngestService)
     }
 
 
+def _build_collection_prompt(item: Dict[str, object]) -> str:
+    return (
+        "You are a collections agent. Generate one concise SMS (2-3 short sentences max).\n"
+        f"Borrower: {item.get('borrower_name')}\n"
+        f"Reason: {item.get('reason_raw')}\n"
+        f"Missed amount: ${item.get('amount')}\n"
+        f"Immediate target (amount + fee): ${item.get('immediate_due_with_fee')}\n"
+        f"Balance context: ${item.get('balance')}\n"
+        f"Wave: {item.get('wave')}\n"
+        "Rules: controlled professional tone, direct ask, no emoji, no long explanation, end with action."
+    )
+
+
 @require_POST
 @user_passes_test(lambda u: u.is_active and u.is_superuser)
 def superadmin_dashboard_execute(request):
@@ -85,6 +96,8 @@ def superadmin_dashboard_execute(request):
     board_id = str(body.get("board_id", 70))
     group_id = int(body.get("group_id", 91))
     limit = max(1, min(10, int(body.get("limit", 5))))
+    temperature = float(body.get("temperature", 0.2))
+    max_new_tokens = int(body.get("max_new_tokens", 220))
 
     client = ICollectorClient()
     ingest = CRMIngestService(client=client)
@@ -113,43 +126,44 @@ def superadmin_dashboard_execute(request):
         )
         ingestion_preview.append(_normalize_row_for_preview(row, ingest))
 
-    gemini_key = os.getenv("GEMINI_API_KEY", "").strip()
     gemini_previews = []
-    if gemini_key:
+    for item in ingestion_preview:
+        if not item.get("amount"):
+            gemini_previews.append(
+                {
+                    "row_id": item.get("row_id"),
+                    "borrower_name": item.get("borrower_name"),
+                    "status": "skipped",
+                    "message": "Amount missing, preview skipped.",
+                }
+            )
+            continue
         try:
-            generator = GeminiMessageGenerator(gemini_key)
-            for item in ingestion_preview:
-                if not item.get("amount"):
-                    gemini_previews.append(
-                        {
-                            "row_id": item.get("row_id"),
-                            "borrower_name": item.get("borrower_name"),
-                            "status": "skipped",
-                            "message": "Amount missing, preview skipped.",
-                        }
-                    )
-                    continue
-                msg = generator.generate_collection_message(
-                    borrower_name=item.get("borrower_name") or "Client",
-                    failed_amount=float(item["amount"]),
-                    nsf_fee=50.00,
-                    current_balance=float(item["balance"]) if item.get("balance") else 0.0,
-                    reason=item.get("reason_raw") or "Payment failed",
-                    wave=int(item.get("wave") or 1),
-                    channel="sms",
-                )
-                gemini_previews.append(
-                    {
-                        "row_id": item.get("row_id"),
-                        "borrower_name": item.get("borrower_name"),
-                        "status": "success",
-                        "message": msg,
-                    }
-                )
-        except Exception as exc:  # pragma: no cover
-            gemini_previews = [{"status": "failed", "message": f"Gemini preview failed: {exc}"}]
-    else:
-        gemini_previews = [{"status": "skipped", "message": "GEMINI_API_KEY not configured."}]
+            llm_result = client.generate_collection_llm(
+                prompt=_build_collection_prompt(item),
+                temperature=temperature,
+                max_new_tokens=max_new_tokens,
+                idempotency_key=f"dash-llm-{item.get('row_id')}",
+            )
+            gemini_previews.append(
+                {
+                    "row_id": item.get("row_id"),
+                    "borrower_name": item.get("borrower_name"),
+                    "status": "success",
+                    "message": llm_result.get("answer") or llm_result.get("raw") or "",
+                    "model": llm_result.get("model"),
+                    "idempotent_replay": bool(llm_result.get("idempotent_replay")),
+                }
+            )
+        except ICollectorClientError as exc:
+            gemini_previews.append(
+                {
+                    "row_id": item.get("row_id"),
+                    "borrower_name": item.get("borrower_name"),
+                    "status": "failed",
+                    "message": str(exc),
+                }
+            )
 
     return JsonResponse(
         {
