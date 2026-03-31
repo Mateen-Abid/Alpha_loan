@@ -4,16 +4,20 @@ from __future__ import annotations
 
 import json
 import re
+from decimal import Decimal, InvalidOperation
 from typing import Dict
 
 from django.contrib.auth.decorators import user_passes_test
 from django.http import JsonResponse
 from django.shortcuts import render
 from django.views.decorators.http import require_POST
+from django.utils import timezone
 
 from apps.ai.constants import build_gemini_collection_message_prompt
 from apps.core.integrations import ICollectorClient, ICollectorClientError
 from apps.core.services.ingest_service import CRMIngestService
+from apps.core.services.crm_to_ingestion_service import CRMToIngestionService
+from apps.collections.models import CRMData, IngestionData
 
 
 _KV_PATTERN = re.compile(r"([a-zA-Z0-9_]+)=([^;\n]+)")
@@ -27,6 +31,76 @@ def _extract_meta(notes: str) -> Dict[str, str]:
     for key, value in _KV_PATTERN.findall(notes or ""):
         meta[key] = value.strip()
     return meta
+
+
+def _parse_decimal_safe(value) -> Decimal | None:
+    """Safely parse a value to Decimal."""
+    if value is None:
+        return None
+    try:
+        if isinstance(value, dict):
+            value = value.get("raw") or value.get("value")
+        return Decimal(str(value).replace(",", "").strip())
+    except (InvalidOperation, ValueError, TypeError):
+        return None
+
+
+def _extract_phone_parts(phone_data) -> Dict[str, object]:
+    """Extract phone parts from CRM phone field."""
+    if phone_data is None:
+        return {"raw": None, "formatted": None, "country": None, "valid": None}
+    if isinstance(phone_data, dict):
+        return {
+            "raw": phone_data.get("raw"),
+            "formatted": phone_data.get("formatted"),
+            "country": phone_data.get("country"),
+            "valid": phone_data.get("valid"),
+        }
+    return {"raw": str(phone_data), "formatted": None, "country": None, "valid": None}
+
+
+def _save_crm_row_to_db(row: Dict[str, object], board_id: str, group_id: int) -> CRMData:
+    """
+    Save a single CRM row to the database.
+    Updates existing row if row_id exists, otherwise creates new.
+    """
+    columns = row.get("columns") or {}
+    row_id = int(row.get("id") or 0)
+    
+    phone_parts = _extract_phone_parts(columns.get("Phone Number"))
+    
+    defaults = {
+        "board_id": int(board_id),
+        "group_id": group_id,
+        "group_name": row.get("group_name"),
+        "client": columns.get("Client"),
+        "phone_number_raw": phone_parts["raw"],
+        "phone_number_formatted": phone_parts["formatted"],
+        "phone_number_country": phone_parts["country"],
+        "phone_number_valid": phone_parts["valid"],
+        "email": columns.get("Email"),
+        "amount": _parse_decimal_safe(columns.get("Amount")),
+        "balance": _parse_decimal_safe(columns.get("Balance")),
+        "reason": columns.get("Reason"),
+        "action": columns.get("Action"),
+        "wave": _parse_decimal_safe(columns.get("Wave")),
+        "agent": columns.get("Agent"),
+        "lang": columns.get("Lang"),
+        "cell": columns.get("Cell"),
+        "ref": columns.get("Ref"),
+        "time_zone": columns.get("Time Zone"),
+        "work": columns.get("Work"),
+        "comment": columns.get("Comment"),
+        "world_clock": str(columns.get("World Clock")) if columns.get("World Clock") else None,
+        "raw_columns_json": columns,
+        "synced_at": timezone.now(),
+    }
+    
+    crm_data, created = CRMData.objects.update_or_create(
+        row_id=row_id,
+        defaults=defaults,
+    )
+    return crm_data
 
 
 @user_passes_test(lambda u: u.is_active and u.is_superuser)
@@ -219,60 +293,124 @@ def superadmin_dashboard_execute(request):
     temperature = float(body.get("temperature", 0.2))
     max_new_tokens = int(body.get("max_new_tokens", 220))
 
-    client = ICollectorClient()
-    ingest = CRMIngestService(client=client)
-
+    recent_rows = []
+    ingestion_preview = []
+    ingestion_stats = {}
+    saved_to_db = 0
     rows = []
     total_count = 0
     total_pages = 1
     has_prev = False
     has_next = False
-    if row_id_filter is not None:
-        try:
-            found = _find_row_by_id(
-                client,
-                board_id=board_id,
-                group_id=group_id,
-                row_id=row_id_filter,
-                chunk_size=min(limit, 100),
-            )
-        except ICollectorClientError as exc:
-            return JsonResponse({"status": "failed", "error": str(exc)}, status=502)
-        rows = [found] if found else []
-        total_count = 1 if found else 0
-        page = 1
-        offset = 0
-    else:
-        try:
-            rows_payload = client.get_rows(board_id=board_id, group_id=group_id, limit=limit, offset=offset)
-        except ICollectorClientError as exc:
-            return JsonResponse({"status": "failed", "error": str(exc)}, status=502)
-        rows = rows_payload.get("results") or []
-        # Partner payload may provide either `total` (full dataset) or `count` (page/window count).
-        total_count = int(rows_payload.get("total") or rows_payload.get("count") or len(rows))
+
+    # INGESTION ACTION: Read ALL from CRMData table, process, save to IngestionData table
+    if action == "ingestion":
+        ingestion_service = CRMToIngestionService()
+        
+        # Process ALL CRM data (or filtered by row_id if specified)
+        if row_id_filter is not None:
+            ingestion_stats = ingestion_service.process_by_row_ids([row_id_filter])
+        else:
+            # Process ALL CRM records
+            ingestion_stats = ingestion_service.process_all()
+        
+        # Query ingestion data for display (paginated)
+        ingestion_queryset = IngestionData.objects.all().order_by('-row_id')
+        
+        if row_id_filter is not None:
+            ingestion_queryset = ingestion_queryset.filter(row_id=row_id_filter)
+        
+        total_count = ingestion_queryset.count()
         total_pages = max(1, ((total_count - 1) // limit) + 1) if total_count else 1
         has_prev = page > 1
-        has_next = (offset + len(rows)) < total_count
-    recent_rows = []
-    ingestion_preview = []
+        has_next = (offset + limit) < total_count
+        
+        # Get paginated ingestion records for display
+        ingestion_records = list(ingestion_queryset[offset:offset + limit])
+        ingestion_preview = [
+            {
+                "row_id": rec.row_id,
+                "borrower_name": rec.borrower,
+                "phone": rec.phone,
+                "email": rec.email,
+                "amount": str(rec.amount) if rec.amount else None,
+                "immediate_due_with_fee": str(rec.amount_plus_fee) if rec.amount_plus_fee else None,
+                "balance": str(rec.balance) if rec.balance else None,
+                "reason_code": rec.reason_code,
+                "wave": rec.wave,
+                "is_valid": rec.is_valid,
+                "validation_errors": rec.validation_errors,
+            }
+            for rec in ingestion_records
+        ]
+    
+    # CRM/GEMINI/ALL ACTIONS: Fetch from API
+    else:
+        client = ICollectorClient()
+        ingest = CRMIngestService(client=client)
 
-    for row in rows:
-        columns = row.get("columns") or {}
-        if action in {"all", "crm"}:
-            recent_rows.append(
-                {
-                    "row_id": row.get("id"),
-                    "client": columns.get("Client"),
-                    "reason": columns.get("Reason"),
-                    "amount": columns.get("Amount"),
-                    "balance": columns.get("Balance"),
-                    "action": columns.get("Action"),
-                    "wave": columns.get("Wave"),
-                    "raw_columns": columns,
-                }
-            )
-        if action in {"all", "ingestion", "gemini"}:
-            ingestion_preview.append(_normalize_row_for_preview(row, ingest))
+        if row_id_filter is not None:
+            # Use direct row fetch API for specific row ID
+            try:
+                row_data = client.get_row(str(row_id_filter))
+                # API returns the row directly, wrap it for consistency
+                if row_data and row_data.get("id"):
+                    rows = [row_data]
+                    total_count = 1
+                else:
+                    rows = []
+                    total_count = 0
+            except ICollectorClientError as exc:
+                # Fallback to pagination search if direct fetch fails
+                try:
+                    found = _find_row_by_id(
+                        client,
+                        board_id=board_id,
+                        group_id=group_id,
+                        row_id=row_id_filter,
+                        chunk_size=min(limit, 100),
+                    )
+                    rows = [found] if found else []
+                    total_count = 1 if found else 0
+                except ICollectorClientError as exc2:
+                    return JsonResponse({"status": "failed", "error": str(exc2)}, status=502)
+            page = 1
+            offset = 0
+        else:
+            try:
+                rows_payload = client.get_rows(board_id=board_id, group_id=group_id, limit=limit, offset=offset)
+            except ICollectorClientError as exc:
+                return JsonResponse({"status": "failed", "error": str(exc)}, status=502)
+            rows = rows_payload.get("results") or []
+            total_count = int(rows_payload.get("total") or rows_payload.get("count") or len(rows))
+            total_pages = max(1, ((total_count - 1) // limit) + 1) if total_count else 1
+            has_prev = page > 1
+            has_next = (offset + len(rows)) < total_count
+
+        for row in rows:
+            columns = row.get("columns") or {}
+            if action in {"all", "crm"}:
+                # Save to CRMData table
+                try:
+                    _save_crm_row_to_db(row, board_id, group_id)
+                    saved_to_db += 1
+                except Exception as exc:
+                    pass  # Continue even if save fails
+                
+                recent_rows.append(
+                    {
+                        "row_id": row.get("id"),
+                        "client": columns.get("Client"),
+                        "reason": columns.get("Reason"),
+                        "amount": columns.get("Amount"),
+                        "balance": columns.get("Balance"),
+                        "action": columns.get("Action"),
+                        "wave": columns.get("Wave"),
+                        "raw_columns": columns,
+                    }
+                )
+            if action in {"all", "gemini"}:
+                ingestion_preview.append(_normalize_row_for_preview(row, ingest))
 
     gemini_previews = []
     if action in {"all", "gemini"}:
@@ -338,6 +476,8 @@ def superadmin_dashboard_execute(request):
                 "has_prev": has_prev,
                 "has_next": has_next,
                 "row_id_filter": row_id_filter,
+                "saved_to_db": saved_to_db,
+                "ingestion_stats": ingestion_stats,
             },
             "recent_rows": recent_rows,
             "ingestion_preview": ingestion_preview,

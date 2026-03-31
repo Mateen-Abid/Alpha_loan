@@ -263,6 +263,13 @@ class ICollectorClient:
             body=payload,
         )
 
+    def get_row(self, row_id: str) -> Dict[str, Any]:
+        """Fetch a single row by ID."""
+        return self.request(
+            "GET",
+            f"/api/partner-gateway/v1/crm/row/{row_id}/",
+        )
+
     def update_row(self, row_id: str, data: Dict[str, Any]) -> Dict[str, Any]:
         payload: Dict[str, Any]
         if "data" in data:
