@@ -11,11 +11,15 @@ from django.http import JsonResponse
 from django.shortcuts import render
 from django.views.decorators.http import require_POST
 
+from apps.ai.constants import build_gemini_collection_message_prompt
 from apps.core.integrations import ICollectorClient, ICollectorClientError
 from apps.core.services.ingest_service import CRMIngestService
 
 
 _KV_PATTERN = re.compile(r"([a-zA-Z0-9_]+)=([^;\n]+)")
+_PLACEHOLDER_PATTERN = re.compile(r"\[[^\]]+\]")
+_CALL_US_PATTERN = re.compile(r"\bcall\s+us\b[^.!?]*[.!?]?", re.IGNORECASE)
+_FORMAL_PHRASE_PATTERN = re.compile(r"\b(please remit|to resolve|current balance is)\b", re.IGNORECASE)
 
 
 def _extract_meta(notes: str) -> Dict[str, str]:
@@ -67,16 +71,119 @@ def _normalize_row_for_preview(row: Dict[str, object], ingest: CRMIngestService)
 
 
 def _build_collection_prompt(item: Dict[str, object]) -> str:
-    return (
-        "You are a collections agent. Generate one concise SMS (2-3 short sentences max).\n"
-        f"Borrower: {item.get('borrower_name')}\n"
-        f"Reason: {item.get('reason_raw')}\n"
-        f"Missed amount: ${item.get('amount')}\n"
-        f"Immediate target (amount + fee): ${item.get('immediate_due_with_fee')}\n"
-        f"Balance context: ${item.get('balance')}\n"
-        f"Wave: {item.get('wave')}\n"
-        "Rules: controlled professional tone, direct ask, no emoji, no long explanation, end with action."
+    borrower_name = str(item.get("borrower_name") or "Client").strip()
+    first_name = borrower_name.split()[0] if borrower_name else "Client"
+    failed_amount = float(item.get("amount") or 0.0)
+    current_balance = float(item.get("balance") or failed_amount)
+    reason = str(item.get("reason_raw") or "Payment failed")
+    wave = int(item.get("wave") or 1)
+
+    base_prompt = build_gemini_collection_message_prompt(
+        first_name=first_name,
+        failed_amount=failed_amount,
+        nsf_fee=float(CRMIngestService.FEE_AMOUNT),
+        current_balance=current_balance,
+        reason=reason,
+        wave=wave,
+        tone="collections_controlled",
     )
+    return (
+        f"{base_prompt}\n\n"
+        "Preview-specific constraints:\n"
+        f"- CRM reason: {item.get('reason_raw')}\n"
+        f"- Missed amount: ${item.get('amount')}\n"
+        f"- Immediate target (amount + fee): ${item.get('immediate_due_with_fee')}\n"
+        f"- Balance context only: ${item.get('balance')}\n"
+        "- Do NOT ask borrower to call us.\n"
+        "- Do NOT use placeholders like [Phone Number] or [Company].\n"
+        "- Ask for direct payment/reply action only.\n"
+        "- Return only final SMS text."
+    )
+
+
+def _sanitize_preview_message(message: str) -> str:
+    cleaned = (message or "").strip()
+    cleaned = _PLACEHOLDER_PATTERN.sub("", cleaned)
+    cleaned = _CALL_US_PATTERN.sub("", cleaned)
+    cleaned = re.sub(r"\s{2,}", " ", cleaned).strip()
+    if not cleaned:
+        return "Please reply to this message to confirm payment arrangement."
+    return cleaned
+
+
+def _to_float(value: object, default: float = 0.0) -> float:
+    try:
+        return float(value)  # type: ignore[arg-type]
+    except Exception:
+        return default
+
+
+def _build_contract_fallback_message(item: Dict[str, object]) -> str:
+    borrower_name = str(item.get("borrower_name") or "Client").strip()
+    first_name = borrower_name.split()[0] if borrower_name else "Client"
+    wave = int(_to_float(item.get("wave"), 1.0))
+    immediate_due = _to_float(item.get("immediate_due_with_fee"), _to_float(item.get("amount"), 0.0))
+
+    if wave <= 1:
+        return (
+            f"hey {first_name}, this is mike from ilowns. your payment bounced and total due is ${immediate_due:.2f}. "
+            "are you taking care of this today, or should I lock this for tomorrow morning?"
+        )
+    if wave == 2:
+        return (
+            f"{first_name}, this is still open at ${immediate_due:.2f} and needs to be handled. "
+            "are you clearing this tonight, or am I setting it for tomorrow morning?"
+        )
+    if wave == 3:
+        return (
+            f"{first_name}, this has been sitting and total due is ${immediate_due:.2f}. "
+            "are you handling this now, or do I mark it for tomorrow morning?"
+        )
+    return (
+        f"{first_name}, we're at ${immediate_due:.2f} and this cannot keep waiting. "
+        "are you closing this today, or should I lock tomorrow morning as final timing?"
+    )
+
+
+def _is_contract_compliant(message: str, item: Dict[str, object]) -> bool:
+    text = (message or "").strip().lower()
+    if not text:
+        return False
+    if _FORMAL_PHRASE_PATTERN.search(text):
+        return False
+    if " or " not in text or "?" not in text:
+        return False
+    wave = int(_to_float(item.get("wave"), 1.0))
+    if wave <= 1 and ("mike" not in text or "ilowns" not in text):
+        return False
+    return True
+
+
+def _find_row_by_id(
+    client: ICollectorClient,
+    *,
+    board_id: str,
+    group_id: int,
+    row_id: int,
+    chunk_size: int = 100,
+    max_pages: int = 50,
+) -> Dict[str, object] | None:
+    offset = 0
+    scanned_pages = 0
+    while scanned_pages < max_pages:
+        payload = client.get_rows(board_id=board_id, group_id=group_id, limit=chunk_size, offset=offset)
+        rows = payload.get("results") or []
+        if not rows:
+            return None
+        for row in rows:
+            if int(row.get("id") or 0) == row_id:
+                return row
+        offset += chunk_size
+        scanned_pages += 1
+        total = int(payload.get("count") or 0)
+        if total and offset >= total:
+            return None
+    return None
 
 
 @require_POST
@@ -93,84 +200,183 @@ def superadmin_dashboard_execute(request):
     except json.JSONDecodeError:
         body = {}
 
+    action = str(body.get("action", "all")).strip().lower()
+    if action not in {"all", "crm", "ingestion", "gemini"}:
+        return JsonResponse({"status": "failed", "error": f"Unsupported action '{action}'."}, status=400)
+
     board_id = str(body.get("board_id", 70))
     group_id = int(body.get("group_id", 91))
-    limit = max(1, min(10, int(body.get("limit", 5))))
+    limit = max(1, min(100, int(body.get("limit", 25))))
+    page = max(1, int(body.get("page", 1)))
+    offset = (page - 1) * limit
+    row_id_filter_raw = body.get("row_id")
+    row_id_filter = None
+    if row_id_filter_raw not in (None, "", "null"):
+        try:
+            row_id_filter = int(row_id_filter_raw)
+        except (TypeError, ValueError):
+            return JsonResponse({"status": "failed", "error": "row_id must be numeric."}, status=400)
     temperature = float(body.get("temperature", 0.2))
     max_new_tokens = int(body.get("max_new_tokens", 220))
 
     client = ICollectorClient()
     ingest = CRMIngestService(client=client)
 
-    try:
-        rows_payload = client.get_rows(board_id=board_id, group_id=group_id, limit=limit, offset=0)
-    except ICollectorClientError as exc:
-        return JsonResponse({"status": "failed", "error": str(exc)}, status=502)
-
-    rows = rows_payload.get("results") or []
+    rows = []
+    total_count = 0
+    total_pages = 1
+    has_prev = False
+    has_next = False
+    if row_id_filter is not None:
+        try:
+            found = _find_row_by_id(
+                client,
+                board_id=board_id,
+                group_id=group_id,
+                row_id=row_id_filter,
+                chunk_size=min(limit, 100),
+            )
+        except ICollectorClientError as exc:
+            return JsonResponse({"status": "failed", "error": str(exc)}, status=502)
+        rows = [found] if found else []
+        total_count = 1 if found else 0
+        page = 1
+        offset = 0
+    else:
+        try:
+            rows_payload = client.get_rows(board_id=board_id, group_id=group_id, limit=limit, offset=offset)
+        except ICollectorClientError as exc:
+            return JsonResponse({"status": "failed", "error": str(exc)}, status=502)
+        rows = rows_payload.get("results") or []
+        # Partner payload may provide either `total` (full dataset) or `count` (page/window count).
+        total_count = int(rows_payload.get("total") or rows_payload.get("count") or len(rows))
+        total_pages = max(1, ((total_count - 1) // limit) + 1) if total_count else 1
+        has_prev = page > 1
+        has_next = (offset + len(rows)) < total_count
     recent_rows = []
     ingestion_preview = []
 
-    for row in rows[:limit]:
+    for row in rows:
         columns = row.get("columns") or {}
-        recent_rows.append(
-            {
-                "row_id": row.get("id"),
-                "client": columns.get("Client"),
-                "reason": columns.get("Reason"),
-                "amount": columns.get("Amount"),
-                "balance": columns.get("Balance"),
-                "action": columns.get("Action"),
-                "wave": columns.get("Wave"),
-            }
-        )
-        ingestion_preview.append(_normalize_row_for_preview(row, ingest))
+        if action in {"all", "crm"}:
+            recent_rows.append(
+                {
+                    "row_id": row.get("id"),
+                    "client": columns.get("Client"),
+                    "reason": columns.get("Reason"),
+                    "amount": columns.get("Amount"),
+                    "balance": columns.get("Balance"),
+                    "action": columns.get("Action"),
+                    "wave": columns.get("Wave"),
+                    "raw_columns": columns,
+                }
+            )
+        if action in {"all", "ingestion", "gemini"}:
+            ingestion_preview.append(_normalize_row_for_preview(row, ingest))
 
     gemini_previews = []
-    for item in ingestion_preview:
-        if not item.get("amount"):
-            gemini_previews.append(
-                {
-                    "row_id": item.get("row_id"),
-                    "borrower_name": item.get("borrower_name"),
-                    "status": "skipped",
-                    "message": "Amount missing, preview skipped.",
-                }
-            )
-            continue
-        try:
-            llm_result = client.generate_collection_llm(
-                prompt=_build_collection_prompt(item),
-                temperature=temperature,
-                max_new_tokens=max_new_tokens,
-                idempotency_key=f"dash-llm-{item.get('row_id')}",
-            )
-            gemini_previews.append(
-                {
-                    "row_id": item.get("row_id"),
-                    "borrower_name": item.get("borrower_name"),
-                    "status": "success",
-                    "message": llm_result.get("answer") or llm_result.get("raw") or "",
-                    "model": llm_result.get("model"),
-                    "idempotent_replay": bool(llm_result.get("idempotent_replay")),
-                }
-            )
-        except ICollectorClientError as exc:
-            gemini_previews.append(
-                {
-                    "row_id": item.get("row_id"),
-                    "borrower_name": item.get("borrower_name"),
-                    "status": "failed",
-                    "message": str(exc),
-                }
-            )
+    if action in {"all", "gemini"}:
+        for item in ingestion_preview:
+            if not item.get("amount"):
+                gemini_previews.append(
+                    {
+                        "row_id": item.get("row_id"),
+                        "borrower_name": item.get("borrower_name"),
+                        "phone": item.get("phone"),
+                        "status": "skipped",
+                        "message": "Amount missing, preview skipped.",
+                    }
+                )
+                continue
+            try:
+                llm_result = client.generate_collection_llm(
+                    prompt=_build_collection_prompt(item),
+                    temperature=temperature,
+                    max_new_tokens=max_new_tokens,
+                    idempotency_key=f"dash-llm-{item.get('row_id')}",
+                )
+                raw_message = llm_result.get("answer") or llm_result.get("raw") or ""
+                sanitized_message = _sanitize_preview_message(raw_message)
+                compliant = _is_contract_compliant(sanitized_message, item)
+                gemini_previews.append(
+                    {
+                        "row_id": item.get("row_id"),
+                        "borrower_name": item.get("borrower_name"),
+                        "phone": item.get("phone"),
+                        "status": "success",
+                        "message": sanitized_message if compliant else _build_contract_fallback_message(item),
+                        "model": llm_result.get("model"),
+                        "idempotent_replay": bool(llm_result.get("idempotent_replay")),
+                        "generation_source": "client_gateway_api",
+                        "contract_enforced": not compliant,
+                    }
+                )
+            except ICollectorClientError as exc:
+                gemini_previews.append(
+                    {
+                        "row_id": item.get("row_id"),
+                        "borrower_name": item.get("borrower_name"),
+                        "phone": item.get("phone"),
+                        "status": "failed",
+                        "message": str(exc),
+                    }
+                )
 
     return JsonResponse(
         {
             "status": "success",
-            "meta": {"board_id": board_id, "group_id": group_id, "rows_count": len(rows[:limit])},
+            "action": action,
+            "meta": {
+                "board_id": board_id,
+                "group_id": group_id,
+                "rows_count": len(rows),
+                "count": total_count,
+                "page": page,
+                "limit": limit,
+                "offset": offset,
+                "total_pages": total_pages,
+                "has_prev": has_prev,
+                "has_next": has_next,
+                "row_id_filter": row_id_filter,
+            },
             "recent_rows": recent_rows,
             "ingestion_preview": ingestion_preview,
             "gemini_preview": gemini_previews,
+        }
+    )
+
+
+@require_POST
+@user_passes_test(lambda u: u.is_active and u.is_superuser)
+def superadmin_dashboard_send_sms(request):
+    """Send SMS for a preview row using partner gateway."""
+    try:
+        body = json.loads(request.body.decode("utf-8") or "{}")
+    except json.JSONDecodeError:
+        body = {}
+
+    row_id = body.get("row_id")
+    phone = str(body.get("phone") or "").strip()
+    message = str(body.get("message") or "").strip()
+
+    if not row_id:
+        return JsonResponse({"status": "failed", "error": "row_id is required."}, status=400)
+    if not phone:
+        return JsonResponse({"status": "failed", "error": "phone is required."}, status=400)
+    if not message:
+        return JsonResponse({"status": "failed", "error": "message is required."}, status=400)
+
+    client = ICollectorClient()
+    try:
+        result = client.send_sms(row_id=str(row_id), phone=phone, message=message)
+    except ICollectorClientError as exc:
+        return JsonResponse({"status": "failed", "error": str(exc)}, status=502)
+
+    return JsonResponse(
+        {
+            "status": "success",
+            "row_id": row_id,
+            "phone": phone,
+            "gateway_result": result,
         }
     )

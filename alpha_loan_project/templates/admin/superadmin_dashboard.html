@@ -12,23 +12,49 @@
         <h1 class="text-3xl font-extrabold tracking-tight text-slate-900">Collections Superadmin Dashboard</h1>
         <p class="mt-1 text-sm text-slate-600">CRM fetch + ingestion mapping + Gemini response preview</p>
       </div>
-      <div class="flex items-center gap-3">
-        <button id="execute-btn" class="rounded-xl bg-indigo-600 px-4 py-2.5 text-sm font-semibold text-white shadow hover:bg-indigo-700 disabled:cursor-not-allowed disabled:opacity-60">
-          Execute Preview
+      <div class="flex flex-wrap items-end gap-2">
+        <div>
+          <label for="page-limit" class="mb-1 block text-xs font-semibold uppercase tracking-wide text-slate-600">Page Size</label>
+          <select id="page-limit" class="rounded-lg border border-slate-300 px-2 py-2 text-sm">
+            <option value="10">10</option>
+            <option value="25" selected>25</option>
+            <option value="50">50</option>
+            <option value="100">100</option>
+          </select>
+        </div>
+        <div>
+          <label for="row-id-filter" class="mb-1 block text-xs font-semibold uppercase tracking-wide text-slate-600">Row ID (Optional)</label>
+          <input id="row-id-filter" type="number" placeholder="e.g. 5103" class="w-32 rounded-lg border border-slate-300 px-2 py-2 text-sm" />
+        </div>
+        <button id="execute-crm-btn" class="rounded-xl bg-indigo-600 px-4 py-2.5 text-sm font-semibold text-white shadow hover:bg-indigo-700 disabled:cursor-not-allowed disabled:opacity-60">
+          Execute CRM
+        </button>
+        <button id="execute-ingest-btn" class="rounded-xl bg-slate-700 px-4 py-2.5 text-sm font-semibold text-white shadow hover:bg-slate-800 disabled:cursor-not-allowed disabled:opacity-60">
+          Execute Mapping
+        </button>
+        <button id="execute-gemini-btn" class="rounded-xl bg-emerald-600 px-4 py-2.5 text-sm font-semibold text-white shadow hover:bg-emerald-700 disabled:cursor-not-allowed disabled:opacity-60">
+          Execute Message
         </button>
       </div>
     </div>
     <div id="execute-status" class="mb-4 rounded-md border border-slate-200 bg-slate-50 px-3 py-2 text-sm font-medium text-slate-700">
-      Click Execute Preview to pull latest 5 rows from board 70/group 91.
+      Use Execute CRM to load rows. Mapping and Message buttons run separately.
     </div>
 
     <div class="grid grid-cols-1 gap-4 xl:grid-cols-3">
       <section class="rounded-2xl border border-slate-200 bg-white shadow-sm">
-        <div class="border-b border-slate-100 px-4 py-3 text-sm font-semibold text-slate-900">Recent CRM Rows (5)</div>
+        <div class="flex items-center justify-between border-b border-slate-100 px-4 py-3">
+          <div class="text-sm font-semibold text-slate-900">CRM Rows (Paginated)</div>
+          <div class="flex items-center gap-2">
+            <button id="crm-prev-btn" class="rounded-md border border-slate-300 px-2 py-1 text-xs font-medium text-slate-700">Prev</button>
+            <span id="crm-page-info" class="text-xs text-slate-600">Page 1</span>
+            <button id="crm-next-btn" class="rounded-md border border-slate-300 px-2 py-1 text-xs font-medium text-slate-700">Next</button>
+          </div>
+        </div>
         <div class="max-h-[560px] overflow-auto">
           <table class="min-w-full">
             <thead class="bg-slate-50">
-              <tr>
+              <tr id="rows-head">
                 <th class="px-3 py-2 text-left text-xs font-semibold uppercase text-slate-500">Row</th>
                 <th class="px-3 py-2 text-left text-xs font-semibold uppercase text-slate-500">Client</th>
                 <th class="px-3 py-2 text-left text-xs font-semibold uppercase text-slate-500">Reason</th>
@@ -71,5 +97,5 @@
     </div>
   </div>
 </div>
-<script src="{% static 'js/superadmin_dashboard.js' %}"></script>
+<script src="{% static 'js/superadmin_dashboard.js' %}?v=20260331a"></script>
 {% endblock %}
