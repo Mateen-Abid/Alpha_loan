@@ -1,0 +1,616 @@
+{% extends "admin/base_site.html" %}
+{% load static %}
+
+{% block title %}Row Lookup{% endblock %}
+
+{% block content %}
+<script src="https://cdn.tailwindcss.com"></script>
+
+<!-- Navbar -->
+<nav class="bg-slate-800 -m-2 mb-0">
+  <div class="mx-auto max-w-[1350px] px-4">
+    <div class="flex h-14 items-center justify-between">
+      <div class="flex items-center gap-6">
+        <span class="text-lg font-bold text-white">Alpha Collections</span>
+        <div class="flex gap-1">
+          <a href="{% url 'superadmin_dashboard' %}" class="rounded-md px-3 py-2 text-sm font-medium text-slate-300 hover:bg-slate-700 hover:text-white">
+            Pipeline Dashboard
+          </a>
+          <a href="{% url 'row_lookup' %}" class="rounded-md bg-slate-700 px-3 py-2 text-sm font-medium text-white">
+            Row Lookup
+          </a>
+        </div>
+      </div>
+      <div class="flex items-center gap-3">
+        <span class="text-sm text-slate-400">Connected to DB</span>
+        <span class="h-2 w-2 rounded-full bg-emerald-400"></span>
+      </div>
+    </div>
+  </div>
+</nav>
+
+<div id="lookup-root" class="min-h-screen bg-slate-100 p-5">
+  <div class="mx-auto max-w-[1200px]">
+    
+    <!-- Header & Search -->
+    <div class="mb-6">
+      <h1 class="text-3xl font-extrabold tracking-tight text-slate-900">Row Lookup</h1>
+      <p class="mt-1 text-sm text-slate-600">Search for a specific row ID to view CRM and Ingestion data from database</p>
+    </div>
+
+    <!-- Search Box -->
+    <div class="mb-6 rounded-2xl border border-slate-200 bg-white p-6 shadow-sm">
+      <div class="flex items-end gap-4">
+        <div class="flex-1">
+          <label for="lookup-row-id" class="mb-2 block text-sm font-semibold text-slate-700">Enter Row ID</label>
+          <input 
+            id="lookup-row-id" 
+            type="number" 
+            placeholder="e.g. 257443" 
+            class="w-full rounded-xl border border-slate-300 px-4 py-3 text-lg focus:border-indigo-500 focus:outline-none focus:ring-2 focus:ring-indigo-200"
+          />
+        </div>
+        <button 
+          id="lookup-btn" 
+          class="rounded-xl bg-indigo-600 px-8 py-3 text-lg font-semibold text-white shadow hover:bg-indigo-700 focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-60"
+        >
+          Search DB
+        </button>
+        <button 
+          id="fetch-all-crm-btn" 
+          class="rounded-xl bg-emerald-600 px-8 py-3 text-lg font-semibold text-white shadow hover:bg-emerald-700 focus:outline-none focus:ring-2 focus:ring-emerald-500 focus:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-60"
+        >
+          Fetch All CRM
+        </button>
+      </div>
+      <div id="lookup-status" class="mt-3 text-sm text-slate-500"></div>
+    </div>
+
+    <!-- All CRM Rows Table -->
+    <div id="all-crm-container" class="hidden mb-6">
+      <div class="rounded-2xl border border-slate-200 bg-white shadow-sm">
+        <div class="border-b border-slate-100 px-6 py-4 flex items-center justify-between">
+          <div>
+            <h2 class="text-lg font-bold text-slate-900">All CRM Rows from API</h2>
+            <p id="crm-rows-count" class="text-sm text-slate-500">Fetching...</p>
+          </div>
+          <div class="flex items-center gap-2">
+            <button id="crm-prev-btn" class="rounded-md border border-slate-300 px-3 py-1.5 text-sm font-medium text-slate-700 hover:bg-slate-50 disabled:opacity-50">Prev</button>
+            <span id="crm-page-info" class="text-sm text-slate-600">Page 1</span>
+            <button id="crm-next-btn" class="rounded-md border border-slate-300 px-3 py-1.5 text-sm font-medium text-slate-700 hover:bg-slate-50 disabled:opacity-50">Next</button>
+          </div>
+        </div>
+        <div class="overflow-auto max-h-[500px]">
+          <table class="min-w-full">
+            <thead class="bg-slate-50 sticky top-0">
+              <tr>
+                <th class="px-4 py-3 text-left text-xs font-semibold uppercase text-slate-500">Row ID</th>
+                <th class="px-4 py-3 text-left text-xs font-semibold uppercase text-slate-500">Client</th>
+                <th class="px-4 py-3 text-left text-xs font-semibold uppercase text-slate-500">Phone</th>
+                <th class="px-4 py-3 text-left text-xs font-semibold uppercase text-slate-500">Amount</th>
+                <th class="px-4 py-3 text-left text-xs font-semibold uppercase text-slate-500">Balance</th>
+                <th class="px-4 py-3 text-left text-xs font-semibold uppercase text-slate-500">Reason</th>
+                <th class="px-4 py-3 text-left text-xs font-semibold uppercase text-slate-500">Wave</th>
+                <th class="px-4 py-3 text-left text-xs font-semibold uppercase text-slate-500">Action</th>
+              </tr>
+            </thead>
+            <tbody id="all-crm-body" class="divide-y divide-slate-100"></tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+
+    <!-- Results -->
+    <div id="results-container" class="hidden space-y-6">
+      
+      <!-- CRM Data Card -->
+      <div class="rounded-2xl border border-slate-200 bg-white shadow-sm">
+        <div class="border-b border-slate-100 px-6 py-4">
+          <h2 class="text-lg font-bold text-slate-900">CRM Data</h2>
+          <p class="text-sm text-slate-500">Raw data from crm_data table</p>
+        </div>
+        <div class="p-6">
+          <div id="crm-data-content" class="grid grid-cols-1 gap-4 md:grid-cols-2 lg:grid-cols-3">
+            <!-- CRM data will be populated here -->
+          </div>
+        </div>
+      </div>
+
+      <!-- Ingestion Data Card -->
+      <div class="rounded-2xl border border-slate-200 bg-white shadow-sm">
+        <div class="border-b border-slate-100 px-6 py-4">
+          <h2 class="text-lg font-bold text-slate-900">Ingestion Data</h2>
+          <p class="text-sm text-slate-500">Normalized data from ingestion_data table</p>
+        </div>
+        <div class="p-6">
+          <div id="ingestion-data-content" class="grid grid-cols-1 gap-4 md:grid-cols-2 lg:grid-cols-3">
+            <!-- Ingestion data will be populated here -->
+          </div>
+        </div>
+      </div>
+
+      <!-- Send Message Card -->
+      <div class="rounded-2xl border border-indigo-200 bg-indigo-50 shadow-sm">
+        <div class="border-b border-indigo-100 px-6 py-4 flex items-center justify-between">
+          <div>
+            <h2 class="text-lg font-bold text-indigo-900">Send Message</h2>
+            <p class="text-sm text-indigo-600">Generate message using LLM API and send SMS</p>
+          </div>
+          <button id="generate-msg-btn" class="rounded-lg bg-slate-700 px-4 py-2 text-sm font-semibold text-white shadow hover:bg-slate-800 disabled:cursor-not-allowed disabled:opacity-60">
+            Generate Message
+          </button>
+        </div>
+        <div class="p-6">
+          <div class="mb-4 grid grid-cols-3 gap-4">
+            <div>
+              <label class="mb-1 block text-sm font-semibold text-slate-700">Phone Number</label>
+              <input id="send-phone" type="text" readonly class="w-full rounded-lg border border-slate-300 bg-slate-100 px-3 py-2 text-sm" />
+            </div>
+            <div>
+              <label class="mb-1 block text-sm font-semibold text-slate-700">Row ID</label>
+              <input id="send-row-id" type="text" readonly class="w-full rounded-lg border border-slate-300 bg-slate-100 px-3 py-2 text-sm" />
+            </div>
+            <div>
+              <label class="mb-1 block text-sm font-semibold text-slate-700">Wave</label>
+              <input id="send-wave" type="text" readonly class="w-full rounded-lg border border-slate-300 bg-slate-100 px-3 py-2 text-sm" />
+            </div>
+          </div>
+          <div class="mb-4">
+            <label class="mb-1 block text-sm font-semibold text-slate-700">LLM Generated Message</label>
+            <textarea id="send-message" rows="5" readonly placeholder="Click 'Generate Message' to generate using LLM API..." class="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm"></textarea>
+            <div id="generate-status" class="mt-1 text-xs text-slate-500"></div>
+          </div>
+          <div class="flex items-center justify-between">
+            <div id="send-status" class="text-sm"></div>
+            <button id="send-sms-btn" disabled class="rounded-xl bg-indigo-600 px-6 py-2.5 text-sm font-semibold text-white shadow hover:bg-indigo-700 disabled:cursor-not-allowed disabled:opacity-60">
+              Send SMS
+            </button>
+          </div>
+        </div>
+      </div>
+
+      <!-- Raw JSON Card -->
+      <div class="rounded-2xl border border-slate-200 bg-white shadow-sm">
+        <div class="border-b border-slate-100 px-6 py-4">
+          <h2 class="text-lg font-bold text-slate-900">Raw JSON Data</h2>
+          <p class="text-sm text-slate-500">Complete raw_columns_json from CRM</p>
+        </div>
+        <div class="p-6">
+          <pre id="raw-json-content" class="max-h-96 overflow-auto rounded-lg bg-slate-900 p-4 text-sm text-emerald-400"></pre>
+        </div>
+      </div>
+
+    </div>
+
+    <!-- No Results -->
+    <div id="no-results" class="hidden rounded-2xl border border-slate-200 bg-white p-12 text-center shadow-sm">
+      <div class="text-6xl">🔍</div>
+      <h3 class="mt-4 text-xl font-semibold text-slate-700">No Data Found</h3>
+      <p class="mt-2 text-slate-500">No records found for this Row ID in the database.</p>
+    </div>
+
+  </div>
+</div>
+
+<script>
+(function() {
+  const rowIdInput = document.getElementById('lookup-row-id');
+  const lookupBtn = document.getElementById('lookup-btn');
+  const statusEl = document.getElementById('lookup-status');
+  const resultsContainer = document.getElementById('results-container');
+  const noResults = document.getElementById('no-results');
+  const crmContent = document.getElementById('crm-data-content');
+  const ingestionContent = document.getElementById('ingestion-data-content');
+  const rawJsonContent = document.getElementById('raw-json-content');
+  
+  // Send SMS elements
+  const sendPhoneInput = document.getElementById('send-phone');
+  const sendRowIdInput = document.getElementById('send-row-id');
+  const sendWaveInput = document.getElementById('send-wave');
+  const sendMessageInput = document.getElementById('send-message');
+  const sendSmsBtn = document.getElementById('send-sms-btn');
+  const sendStatus = document.getElementById('send-status');
+  const generateMsgBtn = document.getElementById('generate-msg-btn');
+  const generateStatus = document.getElementById('generate-status');
+  
+  // Store current data for message generation
+  let currentCrmData = null;
+  let currentIngestionData = null;
+
+  // All CRM elements
+  const fetchAllCrmBtn = document.getElementById('fetch-all-crm-btn');
+  const allCrmContainer = document.getElementById('all-crm-container');
+  const allCrmBody = document.getElementById('all-crm-body');
+  const crmRowsCount = document.getElementById('crm-rows-count');
+  const crmPrevBtn = document.getElementById('crm-prev-btn');
+  const crmNextBtn = document.getElementById('crm-next-btn');
+  const crmPageInfo = document.getElementById('crm-page-info');
+  
+  // Pagination state
+  let crmPage = 1;
+  let crmTotalPages = 1;
+  let crmLimit = 100;
+
+  function getCookie(name) {
+    const cookieValue = document.cookie
+      .split(';')
+      .map(c => c.trim())
+      .find(c => c.startsWith(name + '='));
+    return cookieValue ? decodeURIComponent(cookieValue.split('=')[1]) : '';
+  }
+
+  function createField(label, value, highlight = false) {
+    const div = document.createElement('div');
+    div.className = 'rounded-lg border border-slate-100 bg-slate-50 p-3';
+    div.innerHTML = `
+      <div class="text-xs font-semibold uppercase tracking-wide text-slate-500">${label}</div>
+      <div class="mt-1 text-sm font-medium ${highlight ? 'text-indigo-600' : 'text-slate-900'}">${value || '<span class="text-slate-400">-</span>'}</div>
+    `;
+    return div;
+  }
+
+  function renderCRMData(data) {
+    crmContent.innerHTML = '';
+    if (!data) {
+      crmContent.innerHTML = '<p class="text-slate-500 col-span-3">No CRM data found</p>';
+      return;
+    }
+    
+    const fields = [
+      ['Row ID', data.row_id, true],
+      ['Client', data.client],
+      ['Phone', data.phone_number_raw],
+      ['Email', data.email],
+      ['Amount', data.amount ? `$${data.amount}` : null],
+      ['Balance', data.balance ? `$${data.balance}` : null],
+      ['Reason', data.reason],
+      ['Action', data.action],
+      ['Wave', data.wave],
+      ['Board ID', data.board_id],
+      ['Group ID', data.group_id],
+      ['Group Name', data.group_name],
+      ['Agent', data.agent],
+      ['Language', data.lang],
+      ['Phone Valid', data.phone_number_valid ? 'Yes' : 'No'],
+      ['Phone Country', data.phone_number_country],
+      ['Synced At', data.synced_at],
+      ['Created At', data.created_at],
+    ];
+
+    fields.forEach(([label, value, highlight]) => {
+      crmContent.appendChild(createField(label, value, highlight));
+    });
+  }
+
+  function renderIngestionData(data) {
+    ingestionContent.innerHTML = '';
+    if (!data) {
+      ingestionContent.innerHTML = '<p class="text-slate-500 col-span-3">No Ingestion data found. Click "Execute Mapping" on Pipeline Dashboard to process this row.</p>';
+      return;
+    }
+    
+    const fields = [
+      ['Row ID', data.row_id, true],
+      ['Borrower', data.borrower],
+      ['Phone (E.164)', data.phone],
+      ['Email', data.email],
+      ['Amount', data.amount ? `$${data.amount}` : null],
+      ['Amount + Fee', data.amount_plus_fee ? `$${data.amount_plus_fee}` : null],
+      ['Balance', data.balance ? `$${data.balance}` : null],
+      ['Reason Code', data.reason_code],
+      ['Wave', data.wave],
+      ['Is Valid', data.is_valid ? 'Yes' : 'No'],
+      ['Message Generated', data.message_generated ? 'Yes' : 'No'],
+      ['Message Sent', data.message_sent ? 'Yes' : 'No'],
+      ['Last Message At', data.last_message_at],
+      ['Created At', data.created_at],
+      ['Updated At', data.updated_at],
+    ];
+
+    fields.forEach(([label, value, highlight]) => {
+      ingestionContent.appendChild(createField(label, value, highlight));
+    });
+
+    if (data.validation_errors && data.validation_errors.length > 0) {
+      const errDiv = document.createElement('div');
+      errDiv.className = 'col-span-3 rounded-lg border border-red-200 bg-red-50 p-3';
+      errDiv.innerHTML = `
+        <div class="text-xs font-semibold uppercase tracking-wide text-red-600">Validation Errors</div>
+        <div class="mt-1 text-sm text-red-700">${data.validation_errors.join(', ')}</div>
+      `;
+      ingestionContent.appendChild(errDiv);
+    }
+  }
+
+  function renderRawJson(data) {
+    if (data && data.raw_columns_json) {
+      rawJsonContent.textContent = JSON.stringify(data.raw_columns_json, null, 2);
+    } else {
+      rawJsonContent.textContent = 'No raw JSON data available';
+    }
+  }
+
+  async function lookup() {
+    const rowId = rowIdInput.value.trim();
+    if (!rowId) {
+      statusEl.textContent = 'Please enter a Row ID';
+      statusEl.className = 'mt-3 text-sm text-red-500';
+      return;
+    }
+
+    lookupBtn.disabled = true;
+    lookupBtn.textContent = 'Searching...';
+    statusEl.textContent = 'Fetching data from database...';
+    statusEl.className = 'mt-3 text-sm text-slate-500';
+    resultsContainer.classList.add('hidden');
+    noResults.classList.add('hidden');
+
+    try {
+      const res = await fetch('/admin/row-lookup/api/', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-CSRFToken': getCookie('csrftoken'),
+        },
+        body: JSON.stringify({ row_id: rowId }),
+      });
+
+      const data = await res.json();
+
+      if (!res.ok) {
+        throw new Error(data.error || 'Failed to fetch data');
+      }
+
+      if (!data.crm_data && !data.ingestion_data) {
+        noResults.classList.remove('hidden');
+        statusEl.textContent = `No data found for Row ID: ${rowId}`;
+        statusEl.className = 'mt-3 text-sm text-amber-600';
+      } else {
+        renderCRMData(data.crm_data);
+        renderIngestionData(data.ingestion_data);
+        renderRawJson(data.crm_data);
+        populateSendFields(data.crm_data, data.ingestion_data);
+        resultsContainer.classList.remove('hidden');
+        statusEl.textContent = `Found data for Row ID: ${rowId}`;
+        statusEl.className = 'mt-3 text-sm text-emerald-600';
+      }
+    } catch (err) {
+      statusEl.textContent = err.message;
+      statusEl.className = 'mt-3 text-sm text-red-500';
+    } finally {
+      lookupBtn.disabled = false;
+      lookupBtn.textContent = 'Search';
+    }
+  }
+
+  // Send SMS function
+  async function sendSms() {
+    const phone = sendPhoneInput.value.trim();
+    const rowId = sendRowIdInput.value.trim();
+    const message = sendMessageInput.value.trim();
+
+    if (!phone) {
+      sendStatus.textContent = 'No phone number available';
+      sendStatus.className = 'text-sm text-red-500';
+      return;
+    }
+
+    if (!message) {
+      sendStatus.textContent = 'Please enter a message';
+      sendStatus.className = 'text-sm text-red-500';
+      return;
+    }
+
+    sendSmsBtn.disabled = true;
+    sendSmsBtn.textContent = 'Sending...';
+    sendStatus.textContent = 'Sending SMS...';
+    sendStatus.className = 'text-sm text-slate-500';
+
+    try {
+      const res = await fetch('/admin/row-lookup/send-sms/', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-CSRFToken': getCookie('csrftoken'),
+        },
+        body: JSON.stringify({ 
+          row_id: rowId, 
+          phone: phone, 
+          message: message 
+        }),
+      });
+
+      const data = await res.json();
+
+      if (!res.ok) {
+        throw new Error(data.error || 'Failed to send SMS');
+      }
+
+      sendStatus.textContent = 'SMS sent successfully! Message Sent updated to YES.';
+      sendStatus.className = 'text-sm text-emerald-600 font-semibold';
+      sendSmsBtn.textContent = 'Sent ✓';
+      
+      // Refresh the data to show updated message_sent status
+      setTimeout(() => lookup(), 1500);
+      
+    } catch (err) {
+      sendStatus.textContent = err.message;
+      sendStatus.className = 'text-sm text-red-500';
+      sendSmsBtn.disabled = false;
+      sendSmsBtn.textContent = 'Send SMS';
+    }
+  }
+
+  // Populate send fields when data is loaded
+  function populateSendFields(crmData, ingestionData) {
+    currentCrmData = crmData;
+    currentIngestionData = ingestionData;
+    
+    const phone = ingestionData?.phone || crmData?.phone_number_raw || '';
+    const rowId = crmData?.row_id || ingestionData?.row_id || '';
+    const wave = ingestionData?.wave || crmData?.wave || '1';
+    
+    sendPhoneInput.value = phone;
+    sendRowIdInput.value = rowId;
+    sendWaveInput.value = wave;
+    sendMessageInput.value = '';
+    sendStatus.textContent = '';
+    generateStatus.textContent = '';
+    sendSmsBtn.disabled = true;
+    sendSmsBtn.textContent = 'Send SMS';
+    generateMsgBtn.disabled = false;
+    generateMsgBtn.textContent = 'Generate Message';
+  }
+
+  // Generate message using LLM API
+  async function generateMessage() {
+    const rowId = sendRowIdInput.value.trim();
+    if (!rowId) {
+      generateStatus.textContent = 'Row ID is required';
+      generateStatus.className = 'mt-1 text-xs text-red-500';
+      return;
+    }
+
+    generateMsgBtn.disabled = true;
+    generateMsgBtn.textContent = 'Generating...';
+    generateStatus.textContent = 'Calling LLM API...';
+    generateStatus.className = 'mt-1 text-xs text-slate-500';
+
+    try {
+      const res = await fetch('/admin/row-lookup/generate-message/', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-CSRFToken': getCookie('csrftoken'),
+        },
+        body: JSON.stringify({ row_id: rowId }),
+      });
+
+      const data = await res.json();
+
+      if (!res.ok) {
+        throw new Error(data.error || 'Failed to generate message');
+      }
+
+      sendMessageInput.value = data.message;
+      generateStatus.textContent = `Generated using LLM API (model: ${data.model || 'unknown'})`;
+      generateStatus.className = 'mt-1 text-xs text-emerald-600';
+      sendSmsBtn.disabled = false;
+      generateMsgBtn.textContent = 'Regenerate';
+      
+    } catch (err) {
+      generateStatus.textContent = err.message;
+      generateStatus.className = 'mt-1 text-xs text-red-500';
+      generateMsgBtn.textContent = 'Generate Message';
+    } finally {
+      generateMsgBtn.disabled = false;
+    }
+  }
+
+  // Fetch all CRM rows from API
+  async function fetchAllCrm(page = 1) {
+    fetchAllCrmBtn.disabled = true;
+    fetchAllCrmBtn.textContent = 'Fetching...';
+    statusEl.textContent = 'Fetching CRM rows from API...';
+    statusEl.className = 'mt-3 text-sm text-slate-500';
+    
+    // Hide single row results, show table
+    resultsContainer.classList.add('hidden');
+    noResults.classList.add('hidden');
+    allCrmContainer.classList.remove('hidden');
+    crmRowsCount.textContent = 'Loading...';
+
+    try {
+      const res = await fetch('/admin/row-lookup/fetch-all-crm/', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-CSRFToken': getCookie('csrftoken'),
+        },
+        body: JSON.stringify({ page: page, limit: crmLimit }),
+      });
+
+      const data = await res.json();
+
+      if (!res.ok) {
+        throw new Error(data.error || 'Failed to fetch CRM rows');
+      }
+
+      // Update pagination state
+      crmPage = data.page || 1;
+      crmTotalPages = data.total_pages || 1;
+      const totalCount = data.total_count || 0;
+      
+      crmRowsCount.textContent = `Showing ${data.rows.length} of ${totalCount} rows`;
+      crmPageInfo.textContent = `Page ${crmPage} / ${crmTotalPages}`;
+      crmPrevBtn.disabled = crmPage <= 1;
+      crmNextBtn.disabled = crmPage >= crmTotalPages;
+
+      // Render rows
+      renderAllCrmRows(data.rows);
+      
+      statusEl.textContent = `Fetched ${data.rows.length} CRM rows from API`;
+      statusEl.className = 'mt-3 text-sm text-emerald-600';
+      
+    } catch (err) {
+      statusEl.textContent = err.message;
+      statusEl.className = 'mt-3 text-sm text-red-500';
+      crmRowsCount.textContent = 'Error loading data';
+    } finally {
+      fetchAllCrmBtn.disabled = false;
+      fetchAllCrmBtn.textContent = 'Fetch All CRM';
+    }
+  }
+
+  function renderAllCrmRows(rows) {
+    allCrmBody.innerHTML = '';
+    
+    rows.forEach(row => {
+      const tr = document.createElement('tr');
+      tr.className = 'hover:bg-slate-50 cursor-pointer';
+      tr.onclick = () => {
+        rowIdInput.value = row.row_id;
+        lookup();
+      };
+      
+      const phone = row.phone_raw || row.phone || '-';
+      
+      tr.innerHTML = `
+        <td class="px-4 py-3 text-sm font-medium text-indigo-600">${row.row_id || '-'}</td>
+        <td class="px-4 py-3 text-sm text-slate-700">${row.client || '-'}</td>
+        <td class="px-4 py-3 text-sm text-slate-700">${phone}</td>
+        <td class="px-4 py-3 text-sm text-slate-700">${row.amount ? '$' + row.amount : '-'}</td>
+        <td class="px-4 py-3 text-sm text-slate-700">${row.balance ? '$' + row.balance : '-'}</td>
+        <td class="px-4 py-3 text-sm text-slate-700">${row.reason || '-'}</td>
+        <td class="px-4 py-3 text-sm text-slate-700">${row.wave || '-'}</td>
+        <td class="px-4 py-3">
+          <button 
+            class="rounded bg-indigo-100 px-2 py-1 text-xs font-medium text-indigo-700 hover:bg-indigo-200"
+            onclick="event.stopPropagation(); rowIdInput.value = '${row.row_id}'; lookup();"
+          >
+            View
+          </button>
+        </td>
+      `;
+      allCrmBody.appendChild(tr);
+    });
+  }
+
+  lookupBtn.addEventListener('click', lookup);
+  rowIdInput.addEventListener('keypress', (e) => {
+    if (e.key === 'Enter') lookup();
+  });
+  
+  fetchAllCrmBtn.addEventListener('click', () => fetchAllCrm(1));
+  crmPrevBtn.addEventListener('click', () => {
+    if (crmPage > 1) fetchAllCrm(crmPage - 1);
+  });
+  crmNextBtn.addEventListener('click', () => {
+    if (crmPage < crmTotalPages) fetchAllCrm(crmPage + 1);
+  });
+  
+  generateMsgBtn.addEventListener('click', generateMessage);
+  sendSmsBtn.addEventListener('click', sendSms);
+})();
+</script>
+{% endblock %}
