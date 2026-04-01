@@ -6,15 +6,20 @@ import hashlib
 import hmac
 import json
 import logging
-from datetime import datetime, timedelta
+import re
+from datetime import datetime
+from decimal import Decimal, InvalidOperation
+from typing import Dict, Optional
 
 from django.conf import settings
+from django.db.models import Q
 from django.utils import timezone
 from rest_framework import status
 from rest_framework.decorators import api_view, permission_classes, authentication_classes
 from rest_framework.permissions import AllowAny
 from rest_framework.response import Response
 from drf_spectacular.utils import extend_schema, OpenApiExample
+from apps.core.integrations import ICollectorClient, ICollectorClientError
 
 from apps.collections.models import (
     MessagesInbound,
@@ -28,6 +33,12 @@ logger = logging.getLogger(__name__)
 # Cache processed event IDs to prevent duplicate processing
 _processed_events = set()
 MAX_CACHED_EVENTS = 10000
+DAILY_REJECT_BOARD_ID = 70
+DAILY_REJECT_GROUP_ID = 91
+_PHONE_DIGITS_RE = re.compile(r"\D")
+_PLACEHOLDER_PATTERN = re.compile(r"\[[^\]]+\]")
+_CALL_US_PATTERN = re.compile(r"\bcall\s+us\b[^.!?]*[.!?]?", re.IGNORECASE)
+_FORMAL_PHRASE_PATTERN = re.compile(r"\b(please remit|to resolve|current balance is)\b", re.IGNORECASE)
 
 
 def _verify_signature(request) -> bool:
@@ -89,8 +100,7 @@ def _is_duplicate_event(event_id: str) -> bool:
 
 def _normalize_phone(phone: str) -> str:
     """Normalize phone number for matching."""
-    import re
-    digits = re.sub(r'\D', '', phone or '')
+    digits = _PHONE_DIGITS_RE.sub("", phone or "")
     if len(digits) == 11 and digits.startswith('1'):
         digits = digits[1:]
     if len(digits) == 10:
@@ -98,61 +108,439 @@ def _normalize_phone(phone: str) -> str:
     return phone
 
 
-def _find_related_records(phone: str, row_id: int = None):
-    """Find related CRM, Ingestion, and Outbound records by phone or row_id."""
+def _digits_tail(phone: str, tail: int = 10) -> str:
+    digits = _PHONE_DIGITS_RE.sub("", phone or "")
+    if len(digits) > tail:
+        return digits[-tail:]
+    return digits
+
+
+def _parse_row_id(raw_row_id) -> Optional[int]:
+    try:
+        if raw_row_id in (None, "", "null"):
+            return None
+        return int(raw_row_id)
+    except (TypeError, ValueError):
+        return None
+
+
+def _parse_occurred_at(raw_timestamp: object) -> datetime:
+    try:
+        parsed = datetime.fromisoformat(str(raw_timestamp).replace("Z", "+00:00"))
+        if timezone.is_naive(parsed):
+            return timezone.make_aware(parsed)
+        return parsed
+    except (ValueError, TypeError, AttributeError):
+        return timezone.now()
+
+
+def _safe_decimal(value: object) -> Optional[Decimal]:
+    if value in (None, ""):
+        return None
+    try:
+        return Decimal(str(value).replace(",", "").strip())
+    except (InvalidOperation, ValueError, TypeError):
+        return None
+
+
+def _extract_decimal_from_mixed(value: object) -> Optional[Decimal]:
+    if isinstance(value, dict):
+        for key in ("raw", "value", "amount", "text"):
+            if key in value:
+                parsed = _safe_decimal(value.get(key))
+                if parsed is not None:
+                    return parsed
+        return None
+    if isinstance(value, (list, tuple)):
+        for item in value:
+            parsed = _extract_decimal_from_mixed(item)
+            if parsed is not None:
+                return parsed
+        return None
+    return _safe_decimal(value)
+
+
+def _extract_fee_from_raw_columns(crm_data: CRMData | None) -> Optional[Decimal]:
+    if not crm_data:
+        return None
+    raw_columns = getattr(crm_data, "raw_columns_json", None) or {}
+    lower_map = {str(key).strip().lower(): value for key, value in raw_columns.items()}
+    for candidate in ("nsf fee", "fee", "fees", "fees 1", "fees 2", "fees 1/2", "service fee", "fee amount"):
+        if candidate in lower_map:
+            fee = _extract_decimal_from_mixed(lower_map[candidate])
+            if fee is not None and fee >= 0:
+                return fee
+    return None
+
+
+def _resolve_fee_amount(
+    *,
+    amount: Optional[Decimal],
+    amount_plus_fee: Optional[Decimal],
+    crm_data: CRMData | None,
+) -> Optional[Decimal]:
+    if amount is not None and amount_plus_fee is not None:
+        diff = amount_plus_fee - amount
+        if diff >= 0:
+            return diff.quantize(Decimal("0.01"))
+
+    raw_fee = _extract_fee_from_raw_columns(crm_data)
+    if raw_fee is not None:
+        return raw_fee
+
+    configured_fee = _safe_decimal(getattr(settings, "COLLECTION_DEFAULT_FEE_AMOUNT", None))
+    if configured_fee is not None and configured_fee >= 0:
+        return configured_fee
+    return None
+
+
+def _phone_matches_related(normalized_phone: str, related: Dict[str, object]) -> bool:
+    """
+    Verify the inbound phone is consistent with known related records.
+
+    If no related phone is available, allow processing to continue.
+    """
+    inbound_tail = _digits_tail(normalized_phone)
+    if not inbound_tail:
+        return False
+
+    known_phones = []
+    crm_data = related.get("crm_data")
+    if crm_data:
+        known_phones.append(_normalize_phone(getattr(crm_data, "phone_number_raw", "") or ""))
+        known_phones.append(_normalize_phone(getattr(crm_data, "phone_number_formatted", "") or ""))
+
+    ingestion_data = related.get("ingestion_data")
+    if ingestion_data:
+        known_phones.append(_normalize_phone(getattr(ingestion_data, "phone", "") or ""))
+
+    outbound_message = related.get("outbound_message")
+    if outbound_message:
+        known_phones.append(_normalize_phone(getattr(outbound_message, "phone", "") or ""))
+
+    filtered = [_digits_tail(phone) for phone in known_phones if phone]
+    if not filtered:
+        return True
+    return inbound_tail in filtered
+
+
+def _is_daily_reject_related(related: Dict[str, object]) -> bool:
+    crm_data = related.get("crm_data")
+    if not crm_data:
+        return False
+    try:
+        return (
+            int(getattr(crm_data, "board_id", 0)) == DAILY_REJECT_BOARD_ID
+            and int(getattr(crm_data, "group_id", 0)) == DAILY_REJECT_GROUP_ID
+        )
+    except (TypeError, ValueError):
+        return False
+
+
+def _find_related_records(phone: str, row_id: int = None, received_at: Optional[datetime] = None):
+    """Find related CRM, Ingestion, and Outbound records by row/client and timestamp."""
+    resolved_row_id = _parse_row_id(row_id)
+    normalized_phone = _normalize_phone(phone or "")
+    phone_tail = _digits_tail(normalized_phone)
+
     crm_data = None
     ingestion_data = None
     outbound_message = None
     borrower_name = None
-    
+
     # Try to find by row_id first
-    if row_id:
+    if resolved_row_id:
         try:
-            crm_data = CRMData.objects.get(row_id=row_id)
+            crm_data = CRMData.objects.get(row_id=resolved_row_id)
             borrower_name = crm_data.client
         except CRMData.DoesNotExist:
             pass
-        
+
         try:
-            ingestion_data = IngestionData.objects.get(row_id=row_id)
+            ingestion_data = IngestionData.objects.get(row_id=resolved_row_id)
             if not borrower_name:
                 borrower_name = ingestion_data.borrower
         except IngestionData.DoesNotExist:
             pass
-        
-        # Find most recent outbound message for this row
-        outbound_message = MessagesOutbound.objects.filter(
-            row_id=row_id
-        ).order_by('-created_at').first()
-    
+
     # Try to find by phone if no row_id match
     if not crm_data and phone:
-        normalized_phone = _normalize_phone(phone)
-        crm_data = CRMData.objects.filter(
-            phone_number_raw__icontains=normalized_phone[-10:]
-        ).first()
-        
+        crm_qs = CRMData.objects.all()
+        if phone_tail:
+            crm_qs = crm_qs.filter(
+                Q(phone_number_raw__icontains=phone_tail)
+                | Q(phone_number_formatted__icontains=phone_tail)
+            )
+        crm_data = crm_qs.first()
+
         if crm_data:
             borrower_name = crm_data.client
-            row_id = crm_data.row_id
-            
+            resolved_row_id = crm_data.row_id
             try:
-                ingestion_data = IngestionData.objects.get(row_id=row_id)
+                ingestion_data = IngestionData.objects.get(row_id=resolved_row_id)
             except IngestionData.DoesNotExist:
                 pass
-    
-    if not outbound_message and phone:
-        normalized_phone = _normalize_phone(phone)
-        outbound_message = MessagesOutbound.objects.filter(
-            phone__icontains=normalized_phone[-10:]
-        ).order_by('-created_at').first()
-    
+
+    # Pair with the most recent outbound message for the same row/client chain.
+    outbound_qs = MessagesOutbound.objects.all()
+    if resolved_row_id:
+        outbound_qs = outbound_qs.filter(row_id=resolved_row_id)
+    if received_at:
+        outbound_qs = outbound_qs.filter(created_at__lte=received_at)
+
+    if phone_tail:
+        outbound_by_phone = outbound_qs.filter(phone__icontains=phone_tail).order_by("-sent_at", "-created_at")
+        outbound_message = outbound_by_phone.first()
+
+    if not outbound_message:
+        outbound_message = outbound_qs.order_by("-sent_at", "-created_at").first()
+
     return {
-        'crm_data': crm_data,
-        'ingestion_data': ingestion_data,
-        'outbound_message': outbound_message,
-        'borrower_name': borrower_name,
-        'row_id': row_id,
+        "crm_data": crm_data,
+        "ingestion_data": ingestion_data,
+        "outbound_message": outbound_message,
+        "borrower_name": borrower_name,
+        "row_id": resolved_row_id,
+        "normalized_phone": normalized_phone,
+    }
+
+
+def _extract_reply_context(related: Dict[str, object]) -> Dict[str, object]:
+    ingestion_data = related.get("ingestion_data")
+    crm_data = related.get("crm_data")
+    borrower_name = (
+        related.get("borrower_name")
+        or (getattr(ingestion_data, "borrower", None) if ingestion_data else None)
+        or (getattr(crm_data, "client", None) if crm_data else None)
+        or "Client"
+    )
+    first_name = str(borrower_name).split()[0] if borrower_name else "Client"
+
+    amount = None
+    amount_plus_fee = None
+    balance = None
+    reason_code = ""
+    wave = 1
+
+    if ingestion_data:
+        amount = _safe_decimal(getattr(ingestion_data, "amount", None))
+        amount_plus_fee = _safe_decimal(getattr(ingestion_data, "amount_plus_fee", None))
+        balance = _safe_decimal(getattr(ingestion_data, "balance", None))
+        reason_code = str(getattr(ingestion_data, "reason_code", "") or "")
+        try:
+            wave = max(1, min(4, int(getattr(ingestion_data, "wave", 1))))
+        except (TypeError, ValueError):
+            wave = 1
+
+    if crm_data:
+        amount = amount if amount is not None else _safe_decimal(getattr(crm_data, "amount", None))
+        balance = balance if balance is not None else _safe_decimal(getattr(crm_data, "balance", None))
+        if not reason_code:
+            reason_code = str(getattr(crm_data, "reason", "") or "")
+        if not ingestion_data:
+            try:
+                wave = max(1, min(4, int(float(getattr(crm_data, "wave", 1) or 1))))
+            except (TypeError, ValueError):
+                wave = 1
+
+    fee_amount = _resolve_fee_amount(
+        amount=amount,
+        amount_plus_fee=amount_plus_fee,
+        crm_data=crm_data,
+    )
+    if amount_plus_fee is None and amount is not None and fee_amount is not None:
+        amount_plus_fee = amount + fee_amount
+
+    return {
+        "row_id": related.get("row_id"),
+        "borrower_name": borrower_name,
+        "first_name": first_name,
+        "amount": amount or Decimal("0.00"),
+        "amount_plus_fee": amount_plus_fee,
+        "fee_amount": fee_amount,
+        "balance": balance,
+        "reason_code": reason_code or "UNKNOWN",
+        "wave": wave,
+    }
+
+
+def _sanitize_reply_message(message: str) -> str:
+    cleaned = (message or "").strip()
+    cleaned = _PLACEHOLDER_PATTERN.sub("", cleaned)
+    cleaned = _CALL_US_PATTERN.sub("", cleaned)
+    cleaned = re.sub(r"\s{2,}", " ", cleaned).strip()
+    return cleaned
+
+
+def _is_contract_compliant(message: str) -> bool:
+    text = (message or "").strip().lower()
+    if not text:
+        return False
+    if _FORMAL_PHRASE_PATTERN.search(text):
+        return False
+    if _PLACEHOLDER_PATTERN.search(text):
+        return False
+    if _CALL_US_PATTERN.search(text):
+        return False
+    return True
+
+
+def _build_contract_fallback_message(context: Dict[str, object], inbound_text: str) -> str:
+    first_name = context.get("first_name") or "Client"
+    amount_plus_fee = _safe_decimal(context.get("amount_plus_fee")) or _safe_decimal(context.get("amount")) or Decimal("0.00")
+    lower_inbound = (inbound_text or "").lower()
+    if any(token in lower_inbound for token in ("yes", "okay", "ok", "pay", "today", "tomorrow")):
+        return (
+            f"hey {first_name}, thanks for confirming. total due right now is ${amount_plus_fee:.2f}. "
+            "what exact time are you sending it?"
+        )
+    return (
+        f"hey {first_name}, this is mike from ilowns. total due is ${amount_plus_fee:.2f}. "
+        "are you taking care of this today, or should i lock tomorrow morning?"
+    )
+
+
+def _build_reply_prompt(
+    context: Dict[str, object],
+    *,
+    prior_outbound_message: str,
+    inbound_message: str,
+) -> str:
+    balance = _safe_decimal(context.get("balance"))
+    balance_text = f"${balance:.2f}" if balance is not None else "unknown"
+    fee_amount = _safe_decimal(context.get("fee_amount"))
+    due_target = _safe_decimal(context.get("amount_plus_fee")) or _safe_decimal(context.get("amount")) or Decimal("0.00")
+    fee_text = f"${fee_amount:.2f}" if fee_amount is not None else "unknown"
+    return (
+        "You are Mike from iLoans handling an active collections SMS thread.\n\n"
+        f"Borrower: {context.get('borrower_name')}\n"
+        f"Reason code: {context.get('reason_code')}\n"
+        f"Wave: {context.get('wave')}\n"
+        f"Fee amount: {fee_text}\n"
+        f"Amount due target (amount + fee when available): ${due_target:.2f}\n"
+        f"Balance context only: {balance_text}\n\n"
+        "Conversation pair (must use both sides to adjust tone):\n"
+        f"1) Last message sent to borrower:\n{prior_outbound_message or 'No previous outbound message found.'}\n\n"
+        f"2) Borrower reply received:\n{inbound_message}\n\n"
+        "Rules:\n"
+        "- Write one SMS reply only.\n"
+        "- Keep collections tone controlled, direct, and conversational.\n"
+        "- Do not use placeholders.\n"
+        "- Do not ask borrower to call us.\n"
+        "- Ask for concrete payment action/time.\n"
+        "- Respect daily reject context: immediate target is missed amount + fee.\n"
+        "Return only final SMS text."
+    )
+
+
+def _maybe_auto_reply_to_inbound(inbound: MessagesInbound, payload: Dict[str, object], related: Dict[str, object]) -> Dict[str, object]:
+    """Auto-generate and send reply for Daily Reject inbound SMS when safely matched."""
+    if not _is_daily_reject_related(related):
+        return {"status": "skipped", "reason": "out_of_scope"}
+
+    row_id = related.get("row_id")
+    if row_id is None:
+        inbound.requires_human = True
+        inbound.human_notes = "Daily Reject scope matched but row_id missing for safe auto-reply."
+        inbound.save(update_fields=["requires_human", "human_notes", "updated_at"])
+        return {"status": "skipped", "reason": "row_id_missing"}
+
+    normalized_phone = related.get("normalized_phone") or _normalize_phone(inbound.from_phone)
+    if not _phone_matches_related(str(normalized_phone or ""), related):
+        inbound.requires_human = True
+        inbound.human_notes = "Phone mismatch against related client records; auto-reply skipped."
+        inbound.save(update_fields=["requires_human", "human_notes", "updated_at"])
+        return {"status": "skipped", "reason": "phone_mismatch"}
+
+    context = _extract_reply_context(related)
+    previous_outbound = related.get("outbound_message")
+    prior_message_text = getattr(previous_outbound, "message_content", "") if previous_outbound else ""
+    prompt = _build_reply_prompt(
+        context,
+        prior_outbound_message=prior_message_text,
+        inbound_message=inbound.message_content,
+    )
+
+    client = ICollectorClient()
+    idempotency_prefix = str(payload.get("event_id") or f"inbound-{inbound.id}")[:64]
+
+    try:
+        llm_result = client.generate_collection_llm(
+            prompt=prompt,
+            temperature=0.2,
+            max_new_tokens=220,
+            idempotency_key=f"reply-gen-{idempotency_prefix}-{inbound.id}"[:120],
+        )
+    except ICollectorClientError as exc:
+        inbound.requires_human = True
+        inbound.human_notes = f"LLM generation failed: {exc}"
+        inbound.save(update_fields=["requires_human", "human_notes", "updated_at"])
+        return {"status": "failed", "reason": "llm_error", "error": str(exc)}
+
+    raw_message = llm_result.get("answer") or llm_result.get("raw") or ""
+    sanitized = _sanitize_reply_message(raw_message)
+    final_message = sanitized if _is_contract_compliant(sanitized) else _build_contract_fallback_message(context, inbound.message_content)
+
+    try:
+        send_result = client.send_sms_extended(
+            row_id=str(row_id),
+            phone=inbound.from_phone,
+            message=final_message,
+            idempotency_key=f"reply-send-{idempotency_prefix}-{inbound.id}"[:120],
+        )
+    except ICollectorClientError as exc:
+        inbound.requires_human = True
+        inbound.human_notes = f"SMS send failed: {exc}"
+        inbound.save(update_fields=["requires_human", "human_notes", "updated_at"])
+        return {"status": "failed", "reason": "send_error", "error": str(exc)}
+
+    outbound = MessagesOutbound.objects.create(
+        crm_data=related.get("crm_data"),
+        ingestion_data=related.get("ingestion_data"),
+        row_id=int(row_id),
+        borrower_name=str(context.get("borrower_name") or inbound.borrower_name or "Client"),
+        phone=inbound.from_phone,
+        channel=MessagesOutbound.Channel.SMS,
+        wave=int(context.get("wave") or 1),
+        amount=_safe_decimal(context.get("amount")),
+        total_due=_safe_decimal(context.get("amount_plus_fee")),
+        reason=str(context.get("reason_code") or ""),
+        message_content=final_message,
+        prompt_used=prompt,
+        model=str(llm_result.get("model") or "gateway-collection-llm"),
+        status=MessagesOutbound.Status.PENDING,
+        provider="icollector",
+    )
+    outbound.mark_sent(provider_response=send_result)
+
+    ingestion_data = related.get("ingestion_data")
+    if ingestion_data:
+        ingestion_data.message_generated = True
+        ingestion_data.message_sent = True
+        ingestion_data.last_message_at = timezone.now()
+        ingestion_data.save(update_fields=["message_generated", "message_sent", "last_message_at", "updated_at"])
+
+    inbound.outbound_message = outbound
+    inbound.is_processed = True
+    inbound.processed_at = timezone.now()
+    inbound.requires_human = False
+    inbound.human_notes = ""
+    inbound.save(
+        update_fields=[
+            "outbound_message",
+            "is_processed",
+            "processed_at",
+            "requires_human",
+            "human_notes",
+            "updated_at",
+        ]
+    )
+
+    return {
+        "status": "sent",
+        "outbound_id": outbound.id,
+        "row_id": row_id,
+        "message_preview": final_message[:100],
     }
 
 
@@ -166,18 +554,14 @@ def _handle_sms_received(payload: dict) -> dict:
     # Extract message details from payload
     from_phone = data.get('from_phone') or data.get('from') or data.get('phone', '')
     message_content = data.get('message') or data.get('body') or data.get('text', '')
-    row_id = data.get('row_id')
+    row_id = _parse_row_id(data.get("row_id"))
     provider_message_id = data.get('message_id') or data.get('sms_id')
-    
+
     # Parse received_at timestamp
-    occurred_at = payload.get('occurred_at')
-    try:
-        received_at = datetime.fromisoformat(occurred_at.replace('Z', '+00:00'))
-    except (ValueError, TypeError, AttributeError):
-        received_at = timezone.now()
-    
+    received_at = _parse_occurred_at(payload.get("occurred_at"))
+
     # Find related records
-    related = _find_related_records(from_phone, row_id)
+    related = _find_related_records(from_phone, row_id, received_at=received_at)
     
     # Create inbound message record
     inbound = MessagesInbound.objects.create(
@@ -185,7 +569,7 @@ def _handle_sms_received(payload: dict) -> dict:
         crm_data=related['crm_data'],
         ingestion_data=related['ingestion_data'],
         row_id=related['row_id'] or row_id,
-        from_phone=_normalize_phone(from_phone),
+        from_phone=related["normalized_phone"] or _normalize_phone(from_phone),
         borrower_name=related['borrower_name'],
         channel=MessagesInbound.Channel.SMS,
         message_content=message_content,
@@ -196,14 +580,17 @@ def _handle_sms_received(payload: dict) -> dict:
         is_processed=False,
         received_at=received_at,
     )
-    
-    logger.info(f"Saved inbound SMS: id={inbound.id}, from={from_phone}, row_id={row_id}")
-    
+
+    logger.info(f"Saved inbound SMS: id={inbound.id}, from={from_phone}, row_id={related['row_id'] or row_id}")
+
+    auto_reply_result = _maybe_auto_reply_to_inbound(inbound=inbound, payload=payload, related=related)
+
     return {
         'inbound_id': inbound.id,
         'from_phone': from_phone,
         'row_id': related['row_id'] or row_id,
         'message_preview': message_content[:100] if message_content else '',
+        'auto_reply': auto_reply_result,
     }
 
 
@@ -216,17 +603,14 @@ def _handle_email_received(payload: dict) -> dict:
     
     from_email = data.get('from_email') or data.get('from') or data.get('email', '')
     message_content = data.get('body') or data.get('message') or data.get('text', '')
-    row_id = data.get('row_id')
+    row_id = _parse_row_id(data.get("row_id"))
     provider_message_id = data.get('message_id') or data.get('email_id')
     
-    occurred_at = payload.get('occurred_at')
-    try:
-        received_at = datetime.fromisoformat(occurred_at.replace('Z', '+00:00'))
-    except (ValueError, TypeError, AttributeError):
-        received_at = timezone.now()
-    
+    occurred_at = payload.get("occurred_at")
+    received_at = _parse_occurred_at(occurred_at)
+
     # Find related records by row_id
-    related = _find_related_records(None, row_id)
+    related = _find_related_records("", row_id, received_at=received_at)
     
     inbound = MessagesInbound.objects.create(
         outbound_message=related['outbound_message'],
