@@ -70,6 +70,13 @@ def _verify_signature(request) -> bool:
         logger.warning("Invalid timestamp format")
         return False
     
+    # Accept both:
+    # - "<hex>"
+    # - "sha256=<hex>"
+    normalized_signature = signature.strip()
+    if normalized_signature.lower().startswith("sha256="):
+        normalized_signature = normalized_signature.split("=", 1)[1].strip()
+
     # Build canonical string and verify
     body = request.body.decode('utf-8')
     canonical = f"{timestamp}.{nonce}.{body}"
@@ -80,7 +87,7 @@ def _verify_signature(request) -> bool:
         hashlib.sha256
     ).hexdigest()
     
-    return hmac.compare_digest(signature, expected_signature)
+    return hmac.compare_digest(normalized_signature, expected_signature)
 
 
 def _is_duplicate_event(event_id: str) -> bool:
