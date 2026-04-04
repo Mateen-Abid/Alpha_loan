@@ -156,6 +156,13 @@ def _safe_decimal(value: object) -> Optional[Decimal]:
         return None
 
 
+def _truncate_text(value: object, max_length: int) -> str:
+    """Coerce to string and cap length for DB-bound fields."""
+    if value is None:
+        return ""
+    return str(value).strip()[:max_length]
+
+
 def _extract_decimal_from_mixed(value: object) -> Optional[Decimal]:
     if isinstance(value, dict):
         for key in ("raw", "value", "amount", "text"):
@@ -568,7 +575,7 @@ def _handle_sms_received(payload: dict) -> dict:
     from_phone = data.get('from_phone') or data.get('from') or data.get('phone', '')
     message_content = data.get('message') or data.get('body') or data.get('text', '')
     row_id = _parse_row_id(data.get("row_id"))
-    provider_message_id = data.get('message_id') or data.get('sms_id')
+    provider_message_id = _truncate_text(data.get('message_id') or data.get('sms_id'), 100)
 
     # Parse received_at timestamp
     received_at = _parse_occurred_at(payload.get("occurred_at"))
@@ -582,7 +589,7 @@ def _handle_sms_received(payload: dict) -> dict:
         crm_data=related['crm_data'],
         ingestion_data=related['ingestion_data'],
         row_id=related['row_id'] or row_id,
-        from_phone=related["normalized_phone"] or _normalize_phone(from_phone),
+        from_phone=_truncate_text(related["normalized_phone"] or _normalize_phone(from_phone), 50),
         borrower_name=related['borrower_name'],
         channel=MessagesInbound.Channel.SMS,
         message_content=message_content,
@@ -614,10 +621,10 @@ def _handle_email_received(payload: dict) -> dict:
     """
     data = payload.get('data', {})
     
-    from_email = data.get('from_email') or data.get('from') or data.get('email', '')
+    from_email = _truncate_text(data.get('from_email') or data.get('from') or data.get('email', ''), 254)
     message_content = data.get('body') or data.get('message') or data.get('text', '')
     row_id = _parse_row_id(data.get("row_id"))
-    provider_message_id = data.get('message_id') or data.get('email_id')
+    provider_message_id = _truncate_text(data.get('message_id') or data.get('email_id'), 100)
     
     occurred_at = payload.get("occurred_at")
     received_at = _parse_occurred_at(occurred_at)
