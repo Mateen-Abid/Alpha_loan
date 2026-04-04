@@ -10,6 +10,7 @@ import re
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
 from typing import Dict, Optional
+from urllib.parse import urlencode
 
 from django.conf import settings
 from django.db.models import Q
@@ -59,17 +60,6 @@ def _verify_signature(request) -> bool:
         logger.warning("Missing signature headers")
         return False
     
-    # Check timestamp is within acceptable window (5 minutes)
-    try:
-        ts = datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
-        now = timezone.now()
-        if abs((now - ts).total_seconds()) > 300:
-            logger.warning("Timestamp out of window")
-            return False
-    except (ValueError, TypeError):
-        logger.warning("Invalid timestamp format")
-        return False
-    
     # Accept both:
     # - "<hex>"
     # - "sha256=<hex>"
@@ -77,17 +67,33 @@ def _verify_signature(request) -> bool:
     if normalized_signature.lower().startswith("sha256="):
         normalized_signature = normalized_signature.split("=", 1)[1].strip()
 
-    # Build canonical string and verify
-    body = request.body.decode('utf-8')
-    canonical = f"{timestamp}.{nonce}.{body}"
-    
-    expected_signature = hmac.new(
-        secret.encode('utf-8'),
-        canonical.encode('utf-8'),
-        hashlib.sha256
+    # Build canonical (contract) string using method/path/query/body_hash.
+    body_bytes = request.body or b""
+    body_hash = hashlib.sha256(body_bytes).hexdigest()
+    query_string = f"?{urlencode(request.GET, doseq=True)}" if request.GET else ""
+    path_with_query = f"{request.path}{query_string}"
+    contract_canonical = f"{timestamp}.{nonce}.{request.method.upper()}.{path_with_query}.{body_hash}"
+    contract_expected = hmac.new(
+        secret.encode("utf-8"),
+        contract_canonical.encode("utf-8"),
+        hashlib.sha256,
     ).hexdigest()
-    
-    return hmac.compare_digest(normalized_signature, expected_signature)
+    if hmac.compare_digest(normalized_signature, contract_expected):
+        return True
+
+    # Compatibility fallback: some integrations sign "<timestamp>.<nonce>.<raw_body>".
+    legacy_body = body_bytes.decode("utf-8", errors="replace")
+    legacy_canonical = f"{timestamp}.{nonce}.{legacy_body}"
+    legacy_expected = hmac.new(
+        secret.encode("utf-8"),
+        legacy_canonical.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+    if hmac.compare_digest(normalized_signature, legacy_expected):
+        return True
+
+    logger.warning("Webhook signature mismatch for event=%s path=%s", request.headers.get("X-Partner-Event", ""), request.path)
+    return False
 
 
 def _is_duplicate_event(event_id: str) -> bool:
