@@ -421,6 +421,7 @@ def superadmin_dashboard_execute(request):
                         "row_id": item.get("row_id"),
                         "borrower_name": item.get("borrower_name"),
                         "phone": item.get("phone"),
+                        "email": item.get("email"),
                         "status": "skipped",
                         "message": "Amount missing, preview skipped.",
                     }
@@ -441,6 +442,7 @@ def superadmin_dashboard_execute(request):
                         "row_id": item.get("row_id"),
                         "borrower_name": item.get("borrower_name"),
                         "phone": item.get("phone"),
+                        "email": item.get("email"),
                         "status": "success",
                         "message": sanitized_message if compliant else _build_contract_fallback_message(item),
                         "model": llm_result.get("model"),
@@ -455,6 +457,7 @@ def superadmin_dashboard_execute(request):
                         "row_id": item.get("row_id"),
                         "borrower_name": item.get("borrower_name"),
                         "phone": item.get("phone"),
+                        "email": item.get("email"),
                         "status": "failed",
                         "message": str(exc),
                     }
@@ -517,6 +520,44 @@ def superadmin_dashboard_send_sms(request):
             "status": "success",
             "row_id": row_id,
             "phone": phone,
+            "gateway_result": result,
+        }
+    )
+
+
+@require_POST
+@user_passes_test(lambda u: u.is_active and u.is_superuser)
+def superadmin_dashboard_send_email(request):
+    """Send email for a preview row using partner gateway."""
+    try:
+        body = json.loads(request.body.decode("utf-8") or "{}")
+    except json.JSONDecodeError:
+        body = {}
+
+    row_id = body.get("row_id")
+    to_email = str(body.get("to_email") or body.get("email") or "").strip()
+    subject = str(body.get("subject") or "Account Update").strip()
+    message = str(body.get("message") or body.get("body") or "").strip()
+
+    if not row_id:
+        return JsonResponse({"status": "failed", "error": "row_id is required."}, status=400)
+    if not to_email:
+        return JsonResponse({"status": "failed", "error": "to_email is required."}, status=400)
+    if not message:
+        return JsonResponse({"status": "failed", "error": "message is required."}, status=400)
+
+    client = ICollectorClient()
+    try:
+        result = client.send_email(row_id=str(row_id), to_email=to_email, subject=subject, body=message)
+    except ICollectorClientError as exc:
+        return JsonResponse({"status": "failed", "error": str(exc)}, status=502)
+
+    return JsonResponse(
+        {
+            "status": "success",
+            "row_id": row_id,
+            "to_email": to_email,
+            "subject": subject,
             "gateway_result": result,
         }
     )

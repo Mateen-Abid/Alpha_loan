@@ -301,6 +301,12 @@ def send_followup_messages(self):
     for case in cases:
         try:
             is_daily = _is_daily_reject_case(case)
+            channel = _select_outbound_channel(case)
+            interaction_channel = (
+                InteractionLedger.CommunicationChannel.SMS
+                if channel == "sms"
+                else InteractionLedger.CommunicationChannel.EMAIL
+            )
             ai_generated = False
             if is_daily:
                 meta = _extract_meta(case)
@@ -308,7 +314,7 @@ def send_followup_messages(self):
                 no_reply_count = int(meta.get("no_reply_count", "0")) + 1
                 message = _apply_risk_policy(_build_daily_reject_offer(case, level=level, no_reply_count=no_reply_count))
             else:
-                ai_message = orchestrator.generate_outbound_message("sms", _build_case_context(case))
+                ai_message = orchestrator.generate_outbound_message(channel, _build_case_context(case))
                 message = ai_message.get("message") or (
                     f"Reminder: Payment of ${case.get_remaining_balance():.2f} is due on your account."
                 )
@@ -320,7 +326,7 @@ def send_followup_messages(self):
             duplicate_exists = InteractionLedger.objects.filter(
                 collection_case=case,
                 interaction_type=InteractionLedger.InteractionType.OUTBOUND,
-                channel=InteractionLedger.CommunicationChannel.SMS,
+                channel=interaction_channel,
                 message_content=message,
                 created_at__gte=timezone.now() - timedelta(minutes=10),
             ).exists()
@@ -331,10 +337,9 @@ def send_followup_messages(self):
             payload = _build_dispatch_payload(
                 case,
                 message,
-                subject="Collection Reminder",
+                subject="Collection Reminder" if channel == "sms" else "Account Follow-up",
                 ai_generated=ai_generated,
             )
-            channel = _select_outbound_channel(case)
             router.send_message(channel=channel, payload=payload)
 
             next_run = timezone.now() + timedelta(hours=1) if is_daily else timezone.now() + timedelta(days=3)
@@ -378,7 +383,7 @@ def process_borrower_message(self, case_id: int, interaction_id: int, message: s
             return {"status": "success", "idempotent": True}
 
         orchestrator = AIOrchestrator()
-        ai_result = orchestrator.process_borrower_message(message, _build_case_context(case))
+        ai_result = orchestrator.process_borrower_message(message, _build_case_context(case), channel=channel)
         intent_data = ai_result.get("intent", {})
         intent = intent_data.get("intent")
         signal = _classify_message_signal(message, intent)

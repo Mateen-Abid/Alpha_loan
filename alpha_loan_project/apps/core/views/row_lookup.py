@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import json
 
+from django.conf import settings
 from django.contrib.auth.decorators import user_passes_test
+from django.db import DataError
 from django.http import JsonResponse
 from django.shortcuts import render
 from django.views.decorators.http import require_POST
@@ -12,8 +14,15 @@ from django.utils import timezone
 
 from apps.collections.models import CRMData, IngestionData, MessagesOutbound
 from apps.core.integrations import ICollectorClient, ICollectorClientError
-from apps.ai.constants import build_gemini_collection_message_prompt
+from apps.ai.constants import build_gemini_collection_message_prompt, build_openai_email_prompt
 from apps.core.services.ingest_service import CRMIngestService
+from apps.core.services.crm_to_ingestion_service import CRMToIngestionService
+
+
+def _truncate_text(value: object, max_length: int) -> str:
+    if value is None:
+        return ""
+    return str(value).strip()[:max_length]
 
 
 @user_passes_test(lambda u: u.is_active and u.is_superuser)
@@ -182,7 +191,7 @@ def row_lookup_api(request):
 @user_passes_test(lambda u: u.is_active and u.is_superuser)
 def row_lookup_generate_message(request):
     """
-    Generate a collection message using the client's LLM API.
+    Generate an SMS collection message using the client's LLM API.
     Uses the prompt from constants.py (build_gemini_collection_message_prompt).
     """
     try:
@@ -273,6 +282,59 @@ def row_lookup_generate_message(request):
 
 @require_POST
 @user_passes_test(lambda u: u.is_active and u.is_superuser)
+def row_lookup_generate_email_message(request):
+    """
+    Generate an email message body using the email prompt template from constants.py.
+    Keeps email generation separated from SMS tone/prompt flow.
+    """
+    try:
+        body = json.loads(request.body.decode("utf-8") or "{}")
+    except json.JSONDecodeError:
+        return JsonResponse({"error": "Invalid JSON"}, status=400)
+
+    row_id = body.get("row_id")
+    if not row_id:
+        return JsonResponse({"error": "row_id is required"}, status=400)
+
+    try:
+        row_id = int(row_id)
+    except (ValueError, TypeError):
+        return JsonResponse({"error": "row_id must be a number"}, status=400)
+
+    crm_data = CRMData.objects.filter(row_id=row_id).first()
+    ingestion_data = IngestionData.objects.filter(row_id=row_id).first()
+    if not crm_data and not ingestion_data:
+        return JsonResponse({"error": "No data found for this row_id"}, status=404)
+
+    borrower_name = (
+        (ingestion_data.borrower if ingestion_data and ingestion_data.borrower else None)
+        or (crm_data.client if crm_data else None)
+        or "Client"
+    )
+    tenant_name = str(getattr(settings, "ICOLLECTOR_TENANT", "") or "{{tenant}}").strip()
+    deadline = str(getattr(settings, "COLLECTION_EMAIL_STOP_PAYMENT_DEADLINE", "") or "2pm EST today").strip()
+
+    message = build_openai_email_prompt(
+        {
+            "borrower_name": borrower_name,
+            "tenant": tenant_name,
+            "stop_payment_deadline": deadline,
+        }
+    ).strip()
+
+    return JsonResponse(
+        {
+            "status": "success",
+            "row_id": row_id,
+            "subject": "Account Update",
+            "message": message,
+            "generation_source": "constants_email_template",
+        }
+    )
+
+
+@require_POST
+@user_passes_test(lambda u: u.is_active and u.is_superuser)
 def row_lookup_send_sms(request):
     """
     Send SMS to a borrower and update message_sent status.
@@ -284,7 +346,7 @@ def row_lookup_send_sms(request):
         return JsonResponse({"error": "Invalid JSON"}, status=400)
 
     row_id = body.get("row_id")
-    phone = body.get("phone", "").strip()
+    phone = _truncate_text(body.get("phone", ""), 50)
     message = body.get("message", "").strip()
 
     if not row_id:
@@ -325,23 +387,37 @@ def row_lookup_send_sms(request):
         return JsonResponse({"error": f"SMS send failed: {str(exc)}"}, status=502)
 
     # Save to messages_outbound table
-    outbound = MessagesOutbound.objects.create(
-        crm_data=crm_data,
-        ingestion_data=ingestion_data,
-        row_id=row_id,
-        borrower_name=borrower_name,
-        phone=phone,
-        channel=MessagesOutbound.Channel.SMS,
-        wave=ingestion_data.wave if ingestion_data else 1,
-        amount=ingestion_data.amount if ingestion_data else None,
-        total_due=ingestion_data.amount_plus_fee if ingestion_data else None,
-        message_content=message,
-        status=MessagesOutbound.Status.SENT,
-        provider='icollector',
-        provider_response=result,
-        provider_message_id=result.get('sms_log', {}).get('message_id') if result else None,
-        sent_at=timezone.now(),
-    )
+    sms_message_id = _truncate_text(
+        result.get('sms_log', {}).get('message_id') if result else "",
+        100,
+    ) or None
+
+    try:
+        outbound = MessagesOutbound.objects.create(
+            crm_data=crm_data,
+            ingestion_data=ingestion_data,
+            row_id=row_id,
+            borrower_name=_truncate_text(borrower_name, 255),
+            phone=phone,
+            channel=MessagesOutbound.Channel.SMS,
+            wave=ingestion_data.wave if ingestion_data else 1,
+            amount=ingestion_data.amount if ingestion_data else None,
+            total_due=ingestion_data.amount_plus_fee if ingestion_data else None,
+            message_content=message,
+            status=MessagesOutbound.Status.SENT,
+            provider='icollector',
+            provider_response=result,
+            provider_message_id=sms_message_id,
+            sent_at=timezone.now(),
+        )
+    except DataError:
+        return JsonResponse(
+            {
+                "error": "SMS was sent but outbound logging failed due to field length limits. "
+                         "Please shorten message metadata and retry."
+            },
+            status=500,
+        )
 
     # Update ingestion_data message_sent to True
     if ingestion_data:
@@ -357,4 +433,144 @@ def row_lookup_send_sms(request):
         "outbound_id": outbound.id,
         "message_sent": True,
         "api_response": result,
+    })
+
+
+@require_POST
+@user_passes_test(lambda u: u.is_active and u.is_superuser)
+def row_lookup_send_email(request):
+    """
+    Send Email to a borrower and update message_sent status.
+    Also saves the message to messages_outbound table.
+    """
+    try:
+        body = json.loads(request.body.decode("utf-8") or "{}")
+    except json.JSONDecodeError:
+        return JsonResponse({"error": "Invalid JSON"}, status=400)
+
+    row_id = body.get("row_id")
+    to_email = str(body.get("to_email", "") or "").strip()
+    subject = str(body.get("subject", "") or "").strip() or "Account Update"
+    message = str(body.get("message", "") or "").strip()
+
+    if not row_id:
+        return JsonResponse({"error": "row_id is required"}, status=400)
+    if not to_email:
+        return JsonResponse({"error": "to_email is required"}, status=400)
+    if len(to_email) > 254:
+        return JsonResponse({"error": "to_email exceeds max length (254)."}, status=400)
+    if not message:
+        return JsonResponse({"error": "message is required"}, status=400)
+
+    try:
+        row_id = int(row_id)
+    except (ValueError, TypeError):
+        return JsonResponse({"error": "row_id must be a number"}, status=400)
+
+    # Get related data
+    crm_data = None
+    ingestion_data = None
+    borrower_name = "Unknown"
+
+    try:
+        crm_data = CRMData.objects.get(row_id=row_id)
+        borrower_name = crm_data.client or borrower_name
+    except CRMData.DoesNotExist:
+        pass
+
+    try:
+        ingestion_data = IngestionData.objects.get(row_id=row_id)
+        if ingestion_data.borrower:
+            borrower_name = ingestion_data.borrower
+    except IngestionData.DoesNotExist:
+        pass
+
+    client = ICollectorClient()
+    try:
+        result = client.send_email(row_id=str(row_id), to_email=to_email, subject=subject, body=message)
+    except ICollectorClientError as exc:
+        return JsonResponse({"error": f"Email send failed: {str(exc)}"}, status=502)
+
+    email_message_id = None
+    if result:
+        email_message_id = (
+            result.get("email_log", {}).get("message_id")
+            or result.get("message_id")
+            or result.get("id")
+        )
+    email_message_id = _truncate_text(email_message_id, 100) or None
+
+    try:
+        outbound = MessagesOutbound.objects.create(
+            crm_data=crm_data,
+            ingestion_data=ingestion_data,
+            row_id=row_id,
+            borrower_name=_truncate_text(borrower_name, 255),
+            email=to_email,
+            channel=MessagesOutbound.Channel.EMAIL,
+            wave=ingestion_data.wave if ingestion_data else 1,
+            amount=ingestion_data.amount if ingestion_data else None,
+            total_due=ingestion_data.amount_plus_fee if ingestion_data else None,
+            message_content=message,
+            status=MessagesOutbound.Status.SENT,
+            provider='icollector',
+            provider_response=result,
+            provider_message_id=email_message_id,
+            sent_at=timezone.now(),
+        )
+    except DataError:
+        return JsonResponse(
+            {
+                "error": "Email was sent but outbound logging failed due to field length limits. "
+                         "Please shorten message metadata and retry."
+            },
+            status=500,
+        )
+
+    if ingestion_data:
+        ingestion_data.message_sent = True
+        ingestion_data.message_generated = True
+        ingestion_data.last_message_at = timezone.now()
+        ingestion_data.save()
+
+    return JsonResponse({
+        "status": "success",
+        "row_id": row_id,
+        "to_email": to_email,
+        "subject": subject,
+        "outbound_id": outbound.id,
+        "message_sent": True,
+        "api_response": result,
+    })
+
+
+@require_POST
+@user_passes_test(lambda u: u.is_active and u.is_superuser)
+def row_lookup_run_ingestion(request):
+    """
+    Run CRM -> Ingestion mapping for a single row_id already in CRMData.
+    """
+    try:
+        body = json.loads(request.body.decode("utf-8") or "{}")
+    except json.JSONDecodeError:
+        return JsonResponse({"error": "Invalid JSON"}, status=400)
+
+    row_id = body.get("row_id")
+    if not row_id:
+        return JsonResponse({"error": "row_id is required"}, status=400)
+
+    try:
+        row_id = int(row_id)
+    except (ValueError, TypeError):
+        return JsonResponse({"error": "row_id must be a number"}, status=400)
+
+    service = CRMToIngestionService()
+    stats = service.process_by_row_ids([row_id])
+    ingestion = IngestionData.objects.filter(row_id=row_id).first()
+
+    return JsonResponse({
+        "status": "success",
+        "row_id": row_id,
+        "ingestion_stats": stats,
+        "ingestion_exists": bool(ingestion),
     })

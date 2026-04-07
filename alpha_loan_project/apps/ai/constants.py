@@ -148,37 +148,43 @@ Return only SMS text, no JSON, no labels."""
 
 
 def build_openai_email_prompt(context: Dict[str, object]) -> str:
-    """Build OpenAI email user prompt from case context."""
-    memory = context.get('conversation_memory') or "No recent interaction memory available."
-    history = context.get('prior_loan_history') or "No prior loan history available."
-    policy = context.get('policy_flags') or {}
-    policy_text = (
-        f"contract_breach_language_allowed={policy.get('allow_contract_breach_language', True)}, "
-        f"reference_escalation_allowed={policy.get('allow_reference_escalation', False)}"
+    """Build strict final-notice email body from context."""
+    client_name = str(
+        context.get("borrower_name")
+        or context.get("client")
+        or "{{client}}"
+    ).strip()
+    tenant_name = str(
+        context.get("tenant")
+        or context.get("tenant_name")
+        or "{{tenant}}"
+    ).strip()
+    deadline = str(context.get("stop_payment_deadline") or "2pm EST today").strip()
+
+    return (
+        f"{client_name},\n\n"
+        "You stopped your payment without notifying us. "
+        "This violates the contract you signed. "
+        f"Call us by {deadline} to confirm you've removed the stop payment.\n\n"
+        "This is your final notice.\n"
+        "Thank you.\n"
+        f"{tenant_name}"
     )
-    return f"""Generate one professional collections email:
-- Amount due target: ${context.get('amount_due', 0)}
-- Workflow step: {context.get('workflow_step', 'STEP_1')}
-- Borrower name: {context.get('borrower_name', 'Valued Client')}
-- Daily reject rule: collect missed amount + $50 first, not full balance
-- Recent conversation memory:
-{memory}
-- Prior loan history summary:
-{history}
-- Policy flags: {policy_text}
 
-Email rules:
-1) Controlled and authoritative tone.
-2) Keep short paragraphs and direct asks.
-3) End with one concrete next step and timeline.
-4) No excessive politeness or long explanations.
 
-Return only email body text."""
+def build_openai_and_prompt(context: Dict[str, object]) -> str:
+    """Backward-compatible alias for legacy typo usage."""
+    return build_openai_email_prompt(context)
 
 
 def get_openai_email_system_prompt(step: str) -> str:
     """Return OpenAI email system prompt for workflow step."""
-    return f"Write a {step} collection email. Keep it professional but firm."
+    _ = step
+    return (
+        "You are a collections final-notice formatter. "
+        "Return the email body exactly as provided by the user prompt. "
+        "Do not rewrite, add subject, or add explanations."
+    )
 
 
 def build_generic_message_generation_system_prompt(workflow_step: str) -> str:

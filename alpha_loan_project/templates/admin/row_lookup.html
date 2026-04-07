@@ -62,6 +62,12 @@
         >
           Fetch All CRM
         </button>
+        <button
+          id="run-ingestion-btn"
+          class="rounded-xl bg-slate-700 px-8 py-3 text-lg font-semibold text-white shadow hover:bg-slate-800 focus:outline-none focus:ring-2 focus:ring-slate-500 focus:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-60"
+        >
+          Run Ingestion
+        </button>
       </div>
       <div id="lookup-status" class="mt-3 text-sm text-slate-500"></div>
     </div>
@@ -131,20 +137,21 @@
 
       <!-- Send Message Card -->
       <div class="rounded-2xl border border-indigo-200 bg-indigo-50 shadow-sm">
-        <div class="border-b border-indigo-100 px-6 py-4 flex items-center justify-between">
+        <div class="border-b border-indigo-100 px-6 py-4">
           <div>
             <h2 class="text-lg font-bold text-indigo-900">Send Message</h2>
-            <p class="text-sm text-indigo-600">Generate message using LLM API and send SMS</p>
+            <p class="text-sm text-indigo-600">Separate channel flows: generate/send SMS independently from Email</p>
           </div>
-          <button id="generate-msg-btn" class="rounded-lg bg-slate-700 px-4 py-2 text-sm font-semibold text-white shadow hover:bg-slate-800 disabled:cursor-not-allowed disabled:opacity-60">
-            Generate Message
-          </button>
         </div>
         <div class="p-6">
-          <div class="mb-4 grid grid-cols-3 gap-4">
+          <div class="mb-4 grid grid-cols-1 gap-4 md:grid-cols-2 lg:grid-cols-5">
             <div>
               <label class="mb-1 block text-sm font-semibold text-slate-700">Phone Number</label>
               <input id="send-phone" type="text" readonly class="w-full rounded-lg border border-slate-300 bg-slate-100 px-3 py-2 text-sm" />
+            </div>
+            <div>
+              <label class="mb-1 block text-sm font-semibold text-slate-700">Email</label>
+              <input id="send-email" type="text" readonly class="w-full rounded-lg border border-slate-300 bg-slate-100 px-3 py-2 text-sm" />
             </div>
             <div>
               <label class="mb-1 block text-sm font-semibold text-slate-700">Row ID</label>
@@ -154,17 +161,46 @@
               <label class="mb-1 block text-sm font-semibold text-slate-700">Wave</label>
               <input id="send-wave" type="text" readonly class="w-full rounded-lg border border-slate-300 bg-slate-100 px-3 py-2 text-sm" />
             </div>
+            <div>
+              <label class="mb-1 block text-sm font-semibold text-slate-700">Email Subject</label>
+              <input id="send-subject" type="text" value="Account Update" class="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm" />
+            </div>
           </div>
-          <div class="mb-4">
-            <label class="mb-1 block text-sm font-semibold text-slate-700">LLM Generated Message</label>
-            <textarea id="send-message" rows="5" readonly placeholder="Click 'Generate Message' to generate using LLM API..." class="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm"></textarea>
-            <div id="generate-status" class="mt-1 text-xs text-slate-500"></div>
-          </div>
-          <div class="flex items-center justify-between">
-            <div id="send-status" class="text-sm"></div>
-            <button id="send-sms-btn" disabled class="rounded-xl bg-indigo-600 px-6 py-2.5 text-sm font-semibold text-white shadow hover:bg-indigo-700 disabled:cursor-not-allowed disabled:opacity-60">
-              Send SMS
-            </button>
+
+          <div class="grid grid-cols-1 gap-4 lg:grid-cols-2">
+            <div class="rounded-xl border border-indigo-200 bg-white p-4">
+              <div class="mb-2 flex items-center justify-between">
+                <h3 class="text-sm font-bold text-indigo-900">SMS Flow</h3>
+                <button id="generate-sms-btn" disabled class="rounded-lg bg-slate-700 px-3 py-1.5 text-xs font-semibold text-white shadow hover:bg-slate-800 disabled:cursor-not-allowed disabled:opacity-60">
+                  Generate SMS
+                </button>
+              </div>
+              <textarea id="send-sms-message" rows="5" placeholder="Generate SMS first..." class="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm"></textarea>
+              <div id="generate-sms-status" class="mt-1 text-xs text-slate-500"></div>
+              <div class="mt-3 flex items-center justify-between">
+                <div id="send-sms-status" class="text-sm"></div>
+                <button id="send-sms-btn" disabled class="rounded-xl bg-indigo-600 px-6 py-2.5 text-sm font-semibold text-white shadow hover:bg-indigo-700 disabled:cursor-not-allowed disabled:opacity-60">
+                  Send SMS
+                </button>
+              </div>
+            </div>
+
+            <div class="rounded-xl border border-emerald-200 bg-white p-4">
+              <div class="mb-2 flex items-center justify-between">
+                <h3 class="text-sm font-bold text-emerald-900">Email Flow</h3>
+                <button id="generate-email-btn" disabled class="rounded-lg bg-slate-700 px-3 py-1.5 text-xs font-semibold text-white shadow hover:bg-slate-800 disabled:cursor-not-allowed disabled:opacity-60">
+                  Generate Email
+                </button>
+              </div>
+              <textarea id="send-email-message" rows="5" placeholder="Generate Email first..." class="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm"></textarea>
+              <div id="generate-email-status" class="mt-1 text-xs text-slate-500"></div>
+              <div class="mt-3 flex items-center justify-between">
+                <div id="send-email-status" class="text-sm"></div>
+                <button id="send-email-btn" disabled class="rounded-xl bg-emerald-600 px-6 py-2.5 text-sm font-semibold text-white shadow hover:bg-emerald-700 disabled:cursor-not-allowed disabled:opacity-60">
+                  Send Email
+                </button>
+              </div>
+            </div>
           </div>
         </div>
       </div>
@@ -205,13 +241,20 @@
   
   // Send SMS elements
   const sendPhoneInput = document.getElementById('send-phone');
+  const sendEmailInput = document.getElementById('send-email');
   const sendRowIdInput = document.getElementById('send-row-id');
   const sendWaveInput = document.getElementById('send-wave');
-  const sendMessageInput = document.getElementById('send-message');
+  const sendSubjectInput = document.getElementById('send-subject');
+  const sendSmsMessageInput = document.getElementById('send-sms-message');
+  const sendEmailMessageInput = document.getElementById('send-email-message');
   const sendSmsBtn = document.getElementById('send-sms-btn');
-  const sendStatus = document.getElementById('send-status');
-  const generateMsgBtn = document.getElementById('generate-msg-btn');
-  const generateStatus = document.getElementById('generate-status');
+  const sendEmailBtn = document.getElementById('send-email-btn');
+  const sendSmsStatus = document.getElementById('send-sms-status');
+  const sendEmailStatus = document.getElementById('send-email-status');
+  const generateSmsBtn = document.getElementById('generate-sms-btn');
+  const generateEmailBtn = document.getElementById('generate-email-btn');
+  const generateSmsStatus = document.getElementById('generate-sms-status');
+  const generateEmailStatus = document.getElementById('generate-email-status');
   
   // Store current data for message generation
   let currentCrmData = null;
@@ -219,6 +262,7 @@
 
   // All CRM elements
   const fetchAllCrmBtn = document.getElementById('fetch-all-crm-btn');
+  const runIngestionBtn = document.getElementById('run-ingestion-btn');
   const allCrmContainer = document.getElementById('all-crm-container');
   const allCrmBody = document.getElementById('all-crm-body');
   const crmRowsCount = document.getElementById('crm-rows-count');
@@ -237,6 +281,24 @@
       .map(c => c.trim())
       .find(c => c.startsWith(name + '='));
     return cookieValue ? decodeURIComponent(cookieValue.split('=')[1]) : '';
+  }
+
+  async function parseApiResponse(res) {
+    const raw = await res.text();
+    if (!raw) return {};
+    try {
+      return JSON.parse(raw);
+    } catch (e) {
+      const stripped = raw
+        .replace(/<style[\s\S]*?<\/style>/gi, ' ')
+        .replace(/<script[\s\S]*?<\/script>/gi, ' ')
+        .replace(/<[^>]+>/g, ' ')
+        .replace(/\s+/g, ' ')
+        .trim();
+      return {
+        error: stripped || `Request failed with status ${res.status}`,
+      };
+    }
   }
 
   function createField(label, value, highlight = false) {
@@ -330,6 +392,28 @@
     }
   }
 
+  function clearSendFields() {
+    sendPhoneInput.value = '';
+    sendEmailInput.value = '';
+    sendRowIdInput.value = '';
+    sendWaveInput.value = '';
+    sendSubjectInput.value = 'Account Update';
+    sendSmsMessageInput.value = '';
+    sendEmailMessageInput.value = '';
+    sendSmsStatus.textContent = '';
+    sendEmailStatus.textContent = '';
+    generateSmsStatus.textContent = '';
+    generateEmailStatus.textContent = '';
+    sendSmsBtn.disabled = true;
+    sendEmailBtn.disabled = true;
+    sendSmsBtn.textContent = 'Send SMS';
+    sendEmailBtn.textContent = 'Send Email';
+    generateSmsBtn.disabled = true;
+    generateEmailBtn.disabled = true;
+    generateSmsBtn.textContent = 'Generate SMS';
+    generateEmailBtn.textContent = 'Generate Email';
+  }
+
   async function lookup() {
     const rowId = rowIdInput.value.trim();
     if (!rowId) {
@@ -355,13 +439,14 @@
         body: JSON.stringify({ row_id: rowId }),
       });
 
-      const data = await res.json();
+      const data = await parseApiResponse(res);
 
       if (!res.ok) {
         throw new Error(data.error || 'Failed to fetch data');
       }
 
       if (!data.crm_data && !data.ingestion_data) {
+        clearSendFields();
         noResults.classList.remove('hidden');
         statusEl.textContent = `No data found for Row ID: ${rowId}`;
         statusEl.className = 'mt-3 text-sm text-amber-600';
@@ -387,24 +472,24 @@
   async function sendSms() {
     const phone = sendPhoneInput.value.trim();
     const rowId = sendRowIdInput.value.trim();
-    const message = sendMessageInput.value.trim();
+    const message = sendSmsMessageInput.value.trim();
 
     if (!phone) {
-      sendStatus.textContent = 'No phone number available';
-      sendStatus.className = 'text-sm text-red-500';
+      sendSmsStatus.textContent = 'No phone number available';
+      sendSmsStatus.className = 'text-sm text-red-500';
       return;
     }
 
     if (!message) {
-      sendStatus.textContent = 'Please enter a message';
-      sendStatus.className = 'text-sm text-red-500';
+      sendSmsStatus.textContent = 'Please enter SMS message';
+      sendSmsStatus.className = 'text-sm text-red-500';
       return;
     }
 
     sendSmsBtn.disabled = true;
     sendSmsBtn.textContent = 'Sending...';
-    sendStatus.textContent = 'Sending SMS...';
-    sendStatus.className = 'text-sm text-slate-500';
+    sendSmsStatus.textContent = 'Sending SMS...';
+    sendSmsStatus.className = 'text-sm text-slate-500';
 
     try {
       const res = await fetch('/admin/row-lookup/send-sms/', {
@@ -420,24 +505,84 @@
         }),
       });
 
-      const data = await res.json();
+      const data = await parseApiResponse(res);
 
       if (!res.ok) {
         throw new Error(data.error || 'Failed to send SMS');
       }
 
-      sendStatus.textContent = 'SMS sent successfully! Message Sent updated to YES.';
-      sendStatus.className = 'text-sm text-emerald-600 font-semibold';
+      sendSmsStatus.textContent = `SMS sent and saved to outbound (ID: ${data.outbound_id || 'n/a'}).`;
+      sendSmsStatus.className = 'text-sm text-emerald-600 font-semibold';
       sendSmsBtn.textContent = 'Sent ✓';
       
       // Refresh the data to show updated message_sent status
       setTimeout(() => lookup(), 1500);
       
     } catch (err) {
-      sendStatus.textContent = err.message;
-      sendStatus.className = 'text-sm text-red-500';
+      sendSmsStatus.textContent = err.message;
+      sendSmsStatus.className = 'text-sm text-red-500';
       sendSmsBtn.disabled = false;
       sendSmsBtn.textContent = 'Send SMS';
+    }
+  }
+
+  // Send Email function
+  async function sendEmail() {
+    const toEmail = sendEmailInput.value.trim();
+    const rowId = sendRowIdInput.value.trim();
+    const message = sendEmailMessageInput.value.trim();
+    const subject = sendSubjectInput.value.trim() || 'Account Update';
+
+    if (!toEmail) {
+      sendEmailStatus.textContent = 'No email available';
+      sendEmailStatus.className = 'text-sm text-red-500';
+      return;
+    }
+
+    if (!message) {
+      sendEmailStatus.textContent = 'Please enter email message';
+      sendEmailStatus.className = 'text-sm text-red-500';
+      return;
+    }
+
+    sendEmailBtn.disabled = true;
+    sendEmailBtn.textContent = 'Sending...';
+    sendEmailStatus.textContent = 'Sending Email...';
+    sendEmailStatus.className = 'text-sm text-slate-500';
+
+    try {
+      const res = await fetch('/admin/row-lookup/send-email/', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-CSRFToken': getCookie('csrftoken'),
+        },
+        body: JSON.stringify({
+          row_id: rowId,
+          to_email: toEmail,
+          subject: subject,
+          message: message
+        }),
+      });
+
+      const data = await parseApiResponse(res);
+
+      if (!res.ok) {
+        throw new Error(data.error || 'Failed to send Email');
+      }
+
+      sendEmailStatus.textContent = `Email sent and saved to outbound (ID: ${data.outbound_id || 'n/a'}).`;
+      sendEmailStatus.className = 'text-sm text-emerald-600 font-semibold';
+      sendEmailBtn.textContent = 'Sent ✓';
+      
+      // Refresh the data to show updated message_sent status
+      setTimeout(() => lookup(), 1500);
+      
+    } catch (err) {
+      sendEmailStatus.textContent = err.message;
+      sendEmailStatus.className = 'text-sm text-red-500';
+      sendEmailBtn.disabled = false;
+      sendEmailBtn.textContent = 'Send Email';
     }
   }
 
@@ -447,34 +592,44 @@
     currentIngestionData = ingestionData;
     
     const phone = ingestionData?.phone || crmData?.phone_number_raw || '';
+    const email = ingestionData?.email || crmData?.email || '';
     const rowId = crmData?.row_id || ingestionData?.row_id || '';
     const wave = ingestionData?.wave || crmData?.wave || '1';
     
     sendPhoneInput.value = phone;
+    sendEmailInput.value = email;
     sendRowIdInput.value = rowId;
     sendWaveInput.value = wave;
-    sendMessageInput.value = '';
-    sendStatus.textContent = '';
-    generateStatus.textContent = '';
+    sendSubjectInput.value = 'Account Update';
+    sendSmsMessageInput.value = '';
+    sendEmailMessageInput.value = '';
+    sendSmsStatus.textContent = '';
+    sendEmailStatus.textContent = '';
+    generateSmsStatus.textContent = '';
+    generateEmailStatus.textContent = '';
     sendSmsBtn.disabled = true;
+    sendEmailBtn.disabled = true;
     sendSmsBtn.textContent = 'Send SMS';
-    generateMsgBtn.disabled = false;
-    generateMsgBtn.textContent = 'Generate Message';
+    sendEmailBtn.textContent = 'Send Email';
+    generateSmsBtn.disabled = false;
+    generateEmailBtn.disabled = false;
+    generateSmsBtn.textContent = 'Generate SMS';
+    generateEmailBtn.textContent = 'Generate Email';
   }
 
-  // Generate message using LLM API
-  async function generateMessage() {
+  // Generate SMS message using LLM API
+  async function generateSmsMessage() {
     const rowId = sendRowIdInput.value.trim();
     if (!rowId) {
-      generateStatus.textContent = 'Row ID is required';
-      generateStatus.className = 'mt-1 text-xs text-red-500';
+      generateSmsStatus.textContent = 'Row ID is required';
+      generateSmsStatus.className = 'mt-1 text-xs text-red-500';
       return;
     }
 
-    generateMsgBtn.disabled = true;
-    generateMsgBtn.textContent = 'Generating...';
-    generateStatus.textContent = 'Calling LLM API...';
-    generateStatus.className = 'mt-1 text-xs text-slate-500';
+    generateSmsBtn.disabled = true;
+    generateSmsBtn.textContent = 'Generating...';
+    generateSmsStatus.textContent = 'Calling LLM API for SMS...';
+    generateSmsStatus.className = 'mt-1 text-xs text-slate-500';
 
     try {
       const res = await fetch('/admin/row-lookup/generate-message/', {
@@ -486,24 +641,114 @@
         body: JSON.stringify({ row_id: rowId }),
       });
 
-      const data = await res.json();
+      const data = await parseApiResponse(res);
 
       if (!res.ok) {
         throw new Error(data.error || 'Failed to generate message');
       }
 
-      sendMessageInput.value = data.message;
-      generateStatus.textContent = `Generated using LLM API (model: ${data.model || 'unknown'})`;
-      generateStatus.className = 'mt-1 text-xs text-emerald-600';
-      sendSmsBtn.disabled = false;
-      generateMsgBtn.textContent = 'Regenerate';
+      sendSmsMessageInput.value = data.message;
+      generateSmsStatus.textContent = `SMS generated using LLM API (model: ${data.model || 'unknown'})`;
+      generateSmsStatus.className = 'mt-1 text-xs text-emerald-600';
+      sendSmsBtn.disabled = !sendPhoneInput.value.trim();
+      generateSmsBtn.textContent = 'Regenerate SMS';
       
     } catch (err) {
-      generateStatus.textContent = err.message;
-      generateStatus.className = 'mt-1 text-xs text-red-500';
-      generateMsgBtn.textContent = 'Generate Message';
+      generateSmsStatus.textContent = err.message;
+      generateSmsStatus.className = 'mt-1 text-xs text-red-500';
+      generateSmsBtn.textContent = 'Generate SMS';
     } finally {
-      generateMsgBtn.disabled = false;
+      generateSmsBtn.disabled = false;
+    }
+  }
+
+  // Generate Email message using email template flow
+  async function generateEmailMessage() {
+    const rowId = sendRowIdInput.value.trim();
+    if (!rowId) {
+      generateEmailStatus.textContent = 'Row ID is required';
+      generateEmailStatus.className = 'mt-1 text-xs text-red-500';
+      return;
+    }
+
+    generateEmailBtn.disabled = true;
+    generateEmailBtn.textContent = 'Generating...';
+    generateEmailStatus.textContent = 'Building email from channel-specific prompt...';
+    generateEmailStatus.className = 'mt-1 text-xs text-slate-500';
+
+    try {
+      const res = await fetch('/admin/row-lookup/generate-email-message/', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-CSRFToken': getCookie('csrftoken'),
+        },
+        body: JSON.stringify({ row_id: rowId }),
+      });
+
+      const data = await parseApiResponse(res);
+
+      if (!res.ok) {
+        throw new Error(data.error || 'Failed to generate email');
+      }
+
+      sendEmailMessageInput.value = data.message;
+      if (data.subject && !sendSubjectInput.value.trim()) {
+        sendSubjectInput.value = data.subject;
+      }
+      generateEmailStatus.textContent = `Email generated (${data.generation_source || 'template'})`;
+      generateEmailStatus.className = 'mt-1 text-xs text-emerald-600';
+      sendEmailBtn.disabled = !sendEmailInput.value.trim();
+      generateEmailBtn.textContent = 'Regenerate Email';
+
+    } catch (err) {
+      generateEmailStatus.textContent = err.message;
+      generateEmailStatus.className = 'mt-1 text-xs text-red-500';
+      generateEmailBtn.textContent = 'Generate Email';
+    } finally {
+      generateEmailBtn.disabled = false;
+    }
+  }
+
+  // Run ingestion mapping for the selected row
+  async function runIngestion() {
+    const rowId = rowIdInput.value.trim();
+    if (!rowId) {
+      statusEl.textContent = 'Enter a Row ID first to run ingestion';
+      statusEl.className = 'mt-3 text-sm text-red-500';
+      return;
+    }
+
+    runIngestionBtn.disabled = true;
+    runIngestionBtn.textContent = 'Running...';
+    statusEl.textContent = `Running ingestion for Row ID ${rowId}...`;
+    statusEl.className = 'mt-3 text-sm text-slate-500';
+
+    try {
+      const res = await fetch('/admin/row-lookup/run-ingestion/', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-CSRFToken': getCookie('csrftoken'),
+        },
+        body: JSON.stringify({ row_id: rowId }),
+      });
+
+      const data = await parseApiResponse(res);
+      if (!res.ok) {
+        throw new Error(data.error || 'Failed to run ingestion');
+      }
+
+      const stats = data.ingestion_stats || {};
+      statusEl.textContent = `Ingestion done for Row ${rowId} (processed=${stats.processed || 0}, created=${stats.created || 0}, updated=${stats.updated || 0}, errors=${stats.errors || 0}). Refreshing row data...`;
+      statusEl.className = 'mt-3 text-sm text-emerald-600';
+      await lookup();
+    } catch (err) {
+      statusEl.textContent = err.message;
+      statusEl.className = 'mt-3 text-sm text-red-500';
+    } finally {
+      runIngestionBtn.disabled = false;
+      runIngestionBtn.textContent = 'Run Ingestion';
     }
   }
 
@@ -530,7 +775,7 @@
         body: JSON.stringify({ page: page, limit: crmLimit }),
       });
 
-      const data = await res.json();
+      const data = await parseApiResponse(res);
 
       if (!res.ok) {
         throw new Error(data.error || 'Failed to fetch CRM rows');
@@ -602,6 +847,7 @@
   });
   
   fetchAllCrmBtn.addEventListener('click', () => fetchAllCrm(1));
+  runIngestionBtn.addEventListener('click', runIngestion);
   crmPrevBtn.addEventListener('click', () => {
     if (crmPage > 1) fetchAllCrm(crmPage - 1);
   });
@@ -609,8 +855,11 @@
     if (crmPage < crmTotalPages) fetchAllCrm(crmPage + 1);
   });
   
-  generateMsgBtn.addEventListener('click', generateMessage);
+  generateSmsBtn.addEventListener('click', generateSmsMessage);
+  generateEmailBtn.addEventListener('click', generateEmailMessage);
   sendSmsBtn.addEventListener('click', sendSms);
+  sendEmailBtn.addEventListener('click', sendEmail);
+  clearSendFields();
 })();
 </script>
 {% endblock %}

@@ -12,7 +12,7 @@ class AIOrchestrator:
         self.intent_analyzer = IntentAnalyzer()
         self.message_generator = MessageGenerator()
     
-    def process_borrower_message(self, message: str, case: Dict) -> Dict:
+    def process_borrower_message(self, message: str, case: Dict, channel: str = "sms") -> Dict:
         """
         Process incoming borrower message.
         
@@ -38,7 +38,16 @@ class AIOrchestrator:
             'policy_flags': case.get('policy_flags'),
         }
         
-        response = self.message_generator.generate_sms(context)
+        if channel == "email":
+            email_response = self.message_generator.generate_email(context)
+            response = {
+                "message": email_response.get("body", ""),
+                "subject": email_response.get("subject", "Account Update"),
+                "status": email_response.get("status"),
+                "error": email_response.get("error"),
+            }
+        else:
+            response = self.message_generator.generate_sms(context)
         
         return {
             'intent': intent_result,
@@ -71,6 +80,8 @@ class AIOrchestrator:
         if channel == 'sms':
             return self.message_generator.generate_sms(context)
         elif channel == 'email':
-            return self.message_generator.generate_email(context)
+            email_response = self.message_generator.generate_email(context)
+            email_response["message"] = email_response.get("body", "")
+            return email_response
         else:
             return {'error': f'Unknown channel: {channel}'}

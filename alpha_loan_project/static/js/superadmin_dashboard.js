@@ -170,17 +170,31 @@
       body.textContent = r.message || "";
       const actions = document.createElement("div");
       actions.className = "mt-3 flex items-center gap-2";
-      const sendBtn = document.createElement("button");
-      sendBtn.className =
+      const sendSmsBtn = document.createElement("button");
+      sendSmsBtn.className =
         "send-sms-btn rounded-md bg-indigo-600 px-3 py-1.5 text-xs font-semibold text-white hover:bg-indigo-700 disabled:opacity-50 disabled:cursor-not-allowed";
-      sendBtn.textContent = "Send SMS";
-      sendBtn.dataset.rowId = String(r.row_id || "");
-      sendBtn.dataset.phone = String(r.phone || "");
-      sendBtn.dataset.message = String(r.message || "");
+      sendSmsBtn.textContent = "Send SMS";
+      sendSmsBtn.dataset.rowId = String(r.row_id || "");
+      sendSmsBtn.dataset.phone = String(r.phone || "");
+      sendSmsBtn.dataset.message = String(r.message || "");
       if (!r.phone || !r.message || r.status !== "success") {
-        sendBtn.disabled = true;
+        sendSmsBtn.disabled = true;
       }
-      actions.appendChild(sendBtn);
+
+      const sendEmailBtn = document.createElement("button");
+      sendEmailBtn.className =
+        "send-email-btn rounded-md bg-emerald-600 px-3 py-1.5 text-xs font-semibold text-white hover:bg-emerald-700 disabled:opacity-50 disabled:cursor-not-allowed";
+      sendEmailBtn.textContent = "Send Email";
+      sendEmailBtn.dataset.rowId = String(r.row_id || "");
+      sendEmailBtn.dataset.email = String(r.email || "");
+      sendEmailBtn.dataset.message = String(r.message || "");
+      sendEmailBtn.dataset.subject = "Account Update";
+      if (!r.email || !r.message || r.status !== "success") {
+        sendEmailBtn.disabled = true;
+      }
+
+      actions.appendChild(sendSmsBtn);
+      actions.appendChild(sendEmailBtn);
       card.appendChild(head);
       card.appendChild(body);
       card.appendChild(actions);
@@ -218,6 +232,40 @@
       setStatus(String(err.message || err), "bad");
       btn.disabled = false;
       btn.textContent = original || "Send SMS";
+    }
+  }
+
+  async function sendEmail(btn) {
+    const rowId = btn.dataset.rowId || "";
+    const toEmail = btn.dataset.email || "";
+    const message = btn.dataset.message || "";
+    const subject = btn.dataset.subject || "Account Update";
+    if (!rowId || !toEmail || !message) {
+      setStatus("Missing row_id, email, or message for sending Email.", "bad");
+      return;
+    }
+    btn.disabled = true;
+    const original = btn.textContent;
+    btn.textContent = "Sending...";
+    try {
+      const res = await fetch("/admin/superadmin-dashboard/send-email/", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-CSRFToken": getCookie("csrftoken"),
+        },
+        body: JSON.stringify({ row_id: rowId, to_email: toEmail, subject, message }),
+      });
+      const data = await res.json();
+      if (!res.ok || data.status !== "success") {
+        throw new Error(data.error || "Email send failed.");
+      }
+      setStatus(`Email sent for row ${rowId} to ${toEmail}.`, "ok");
+      btn.textContent = "Sent";
+    } catch (err) {
+      setStatus(String(err.message || err), "bad");
+      btn.disabled = false;
+      btn.textContent = original || "Send Email";
     }
   }
 
@@ -369,6 +417,10 @@
     }
     if (btn.classList.contains("send-sms-btn")) {
       sendSms(btn);
+      return;
+    }
+    if (btn.classList.contains("send-email-btn")) {
+      sendEmail(btn);
     }
   });
 })();
