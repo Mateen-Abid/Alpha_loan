@@ -289,6 +289,10 @@ def send_followup_messages(self):
     Send follow-up messages for active automation cases.
     For Daily Rejects, use deterministic proposal ladder logic.
     """
+    if not bool(getattr(settings, "COLLECTION_AUTO_FOLLOWUPS_ENABLED", False)):
+        logger.info("send_followup_messages skipped: COLLECTION_AUTO_FOLLOWUPS_ENABLED is False")
+        return {"status": "skipped", "reason": "auto_followups_disabled"}
+
     cases = CollectionCase.objects.filter(
         automation_status=CollectionCase.AutomationStatus.ACTIVE,
         status=CollectionCase.CollectionStatus.ACTIVE,

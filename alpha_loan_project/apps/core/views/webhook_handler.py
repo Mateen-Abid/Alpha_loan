@@ -41,6 +41,7 @@ _PHONE_DIGITS_RE = re.compile(r"\D")
 _PLACEHOLDER_PATTERN = re.compile(r"\[[^\]]+\]")
 _CALL_US_PATTERN = re.compile(r"\bcall\s+us\b[^.!?]*[.!?]?", re.IGNORECASE)
 _FORMAL_PHRASE_PATTERN = re.compile(r"\b(please remit|to resolve|current balance is)\b", re.IGNORECASE)
+_MANUAL_OUTBOUND_MODELS = ("manual_dashboard", "manual_row_lookup")
 
 
 def _verify_signature(request) -> bool:
@@ -260,6 +261,56 @@ def _is_daily_reject_related(related: Dict[str, object]) -> bool:
         )
     except (TypeError, ValueError):
         return False
+
+
+def _has_manual_sms_opt_in(related: Dict[str, object]) -> bool:
+    """
+    Allow SMS auto-reply only for threads with prior manual outbound sends.
+
+    Manual sends are identified from dashboard/row-lookup markers, plus legacy
+    rows where prompt_used is empty/null (historical manual sends).
+    """
+    manual_qs = MessagesOutbound.objects.filter(
+        channel=MessagesOutbound.Channel.SMS
+    ).filter(
+        Q(model__in=_MANUAL_OUTBOUND_MODELS)
+        | Q(prompt_used__isnull=True)
+        | Q(prompt_used__exact="")
+    )
+
+    row_id = _parse_row_id(related.get("row_id"))
+    if row_id is not None and manual_qs.filter(row_id=row_id).exists():
+        return True
+
+    normalized_phone = str(related.get("normalized_phone") or "")
+    phone_tail = _digits_tail(normalized_phone)
+    if phone_tail and manual_qs.filter(phone__icontains=phone_tail).exists():
+        return True
+
+    return False
+
+
+def _has_manual_email_opt_in(related: Dict[str, object]) -> bool:
+    """
+    Allow email auto-reply only for threads with prior manual outbound sends.
+    """
+    manual_qs = MessagesOutbound.objects.filter(
+        channel=MessagesOutbound.Channel.EMAIL
+    ).filter(
+        Q(model__in=_MANUAL_OUTBOUND_MODELS)
+        | Q(prompt_used__isnull=True)
+        | Q(prompt_used__exact="")
+    )
+
+    row_id = _parse_row_id(related.get("row_id"))
+    if row_id is not None and manual_qs.filter(row_id=row_id).exists():
+        return True
+
+    normalized_email = _normalize_email(str(related.get("normalized_email") or ""))
+    if normalized_email and manual_qs.filter(email__iexact=normalized_email).exists():
+        return True
+
+    return False
 
 
 def _find_related_records(phone: str, row_id: int = None, received_at: Optional[datetime] = None):
@@ -582,6 +633,12 @@ def _maybe_auto_reply_to_inbound(inbound: MessagesInbound, payload: Dict[str, ob
     if not _is_daily_reject_related(related):
         return {"status": "skipped", "reason": "out_of_scope"}
 
+    if not _has_manual_sms_opt_in(related):
+        inbound.requires_human = True
+        inbound.human_notes = "Auto-reply skipped: no prior manual outbound SMS found for this row/client."
+        inbound.save(update_fields=["requires_human", "human_notes", "updated_at"])
+        return {"status": "skipped", "reason": "manual_opt_in_missing"}
+
     row_id = related.get("row_id")
     if row_id is None:
         inbound.requires_human = True
@@ -730,6 +787,12 @@ def _maybe_auto_reply_to_inbound_email(
         inbound.human_notes = "Auto-reply skipped: out_of_scope (row not in Daily Reject scope)."
         inbound.save(update_fields=["human_notes", "updated_at"])
         return {"status": "skipped", "reason": "out_of_scope"}
+
+    if not _has_manual_email_opt_in(related):
+        inbound.requires_human = True
+        inbound.human_notes = "Email auto-reply skipped: no prior manual outbound email found for this row/client."
+        inbound.save(update_fields=["requires_human", "human_notes", "updated_at"])
+        return {"status": "skipped", "reason": "manual_opt_in_missing"}
 
     row_id = related.get("row_id")
     if row_id is None:

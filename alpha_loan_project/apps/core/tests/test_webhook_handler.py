@@ -217,7 +217,7 @@ class ICollectorWebhookAutoReplyTests(TestCase):
         self.assertEqual(MessagesInbound.objects.filter(row_id=70002).count(), 1)
         self.assertEqual(MessagesOutbound.objects.filter(row_id=70002).count(), 2)  # prior + auto-reply
 
-    def test_missing_prior_outbound_uses_inbound_only_context_and_still_sends(self):
+    def test_missing_prior_outbound_skips_autoreply_until_manual_opt_in_exists(self):
         self._create_crm_and_ingestion(row_id=70003)
 
         with patch(
@@ -237,13 +237,12 @@ class ICollectorWebhookAutoReplyTests(TestCase):
             )
 
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(mock_send.call_count, 1)
-        prompt = mock_generate.call_args.kwargs["prompt"]
-        self.assertIn("No previous outbound message found.", prompt)
-
-        outbound = MessagesOutbound.objects.filter(row_id=70003).order_by("-id").first()
-        self.assertIsNotNone(outbound)
-        self.assertTrue(outbound.message_content.startswith("hey"))
+        body = response.json()
+        self.assertEqual(body["result"]["auto_reply"]["status"], "skipped")
+        self.assertEqual(body["result"]["auto_reply"]["reason"], "manual_opt_in_missing")
+        self.assertEqual(mock_generate.call_count, 0)
+        self.assertEqual(mock_send.call_count, 0)
+        self.assertEqual(MessagesOutbound.objects.filter(row_id=70003).count(), 0)
 
     def test_two_close_inbound_messages_use_correct_latest_pairing(self):
         self._create_crm_and_ingestion(row_id=70004)
@@ -372,6 +371,29 @@ class ICollectorWebhookAutoReplyTests(TestCase):
         self.assertEqual(mock_generate.call_count, 0)
         self.assertEqual(mock_send.call_count, 0)
         self.assertEqual(MessagesInbound.objects.filter(channel=MessagesInbound.Channel.EMAIL).count(), 1)
+
+    def test_email_missing_prior_outbound_skips_autoreply_until_manual_opt_in_exists(self):
+        self._create_crm_and_ingestion(row_id=72011, email="john@example.com")
+
+        with patch(
+            "apps.core.views.webhook_handler.ICollectorClient.generate_collection_llm",
+            return_value={"answer": "Please confirm exact time today.", "model": "collections-gateway"},
+        ) as mock_generate, patch(
+            "apps.core.views.webhook_handler.ICollectorClient.send_email_extended",
+            return_value={"status": "success", "message_id": "email-manual-optin-missing"},
+        ) as mock_send:
+            response = self.api_client.post(
+                "/api/webhooks/icollector/",
+                self._email_payload(event_id="evt-email-no-prior-1", row_id=72011, message="can i pay tomorrow?"),
+                format="json",
+            )
+
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertEqual(body["result"]["auto_reply"]["status"], "skipped")
+        self.assertEqual(body["result"]["auto_reply"]["reason"], "manual_opt_in_missing")
+        self.assertEqual(mock_generate.call_count, 0)
+        self.assertEqual(mock_send.call_count, 0)
 
     def test_email_idempotent_replay_does_not_send_duplicate_outbound(self):
         self._create_crm_and_ingestion(row_id=72003, email="john@example.com")

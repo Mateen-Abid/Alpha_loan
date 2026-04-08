@@ -8,6 +8,7 @@ from decimal import Decimal, InvalidOperation
 from typing import Dict
 
 from django.contrib.auth.decorators import user_passes_test
+from django.db import DataError
 from django.http import JsonResponse
 from django.shortcuts import render
 from django.views.decorators.http import require_POST
@@ -17,7 +18,7 @@ from apps.ai.constants import build_gemini_collection_message_prompt
 from apps.core.integrations import ICollectorClient, ICollectorClientError
 from apps.core.services.ingest_service import CRMIngestService
 from apps.core.services.crm_to_ingestion_service import CRMToIngestionService
-from apps.collections.models import CRMData, IngestionData
+from apps.collections.models import CRMData, IngestionData, MessagesOutbound
 
 
 _KV_PATTERN = re.compile(r"([a-zA-Z0-9_]+)=([^;\n]+)")
@@ -57,6 +58,12 @@ def _extract_phone_parts(phone_data) -> Dict[str, object]:
             "valid": phone_data.get("valid"),
         }
     return {"raw": str(phone_data), "formatted": None, "country": None, "valid": None}
+
+
+def _truncate_text(value: object, max_length: int) -> str:
+    if value is None:
+        return ""
+    return str(value).strip()[:max_length]
 
 
 def _save_crm_row_to_db(row: Dict[str, object], board_id: str, group_id: int) -> CRMData:
@@ -499,7 +506,7 @@ def superadmin_dashboard_send_sms(request):
         body = {}
 
     row_id = body.get("row_id")
-    phone = str(body.get("phone") or "").strip()
+    phone = _truncate_text(body.get("phone"), 50)
     message = str(body.get("message") or "").strip()
 
     if not row_id:
@@ -509,17 +516,71 @@ def superadmin_dashboard_send_sms(request):
     if not message:
         return JsonResponse({"status": "failed", "error": "message is required."}, status=400)
 
+    try:
+        row_id_int = int(row_id)
+    except (TypeError, ValueError):
+        return JsonResponse({"status": "failed", "error": "row_id must be numeric."}, status=400)
+
+    crm_data = CRMData.objects.filter(row_id=row_id_int).first()
+    ingestion_data = IngestionData.objects.filter(row_id=row_id_int).first()
+    borrower_name = (
+        (ingestion_data.borrower if ingestion_data and ingestion_data.borrower else None)
+        or (crm_data.client if crm_data and crm_data.client else None)
+        or "Unknown"
+    )
+
     client = ICollectorClient()
     try:
-        result = client.send_sms(row_id=str(row_id), phone=phone, message=message)
+        result = client.send_sms(row_id=str(row_id_int), phone=phone, message=message)
     except ICollectorClientError as exc:
         return JsonResponse({"status": "failed", "error": str(exc)}, status=502)
+
+    sms_message_id = _truncate_text(
+        (result.get("sms_log", {}) or {}).get("message_id") if isinstance(result, dict) else "",
+        100,
+    ) or None
+
+    try:
+        outbound = MessagesOutbound.objects.create(
+            crm_data=crm_data,
+            ingestion_data=ingestion_data,
+            row_id=row_id_int,
+            borrower_name=_truncate_text(borrower_name, 255),
+            phone=phone,
+            channel=MessagesOutbound.Channel.SMS,
+            wave=ingestion_data.wave if ingestion_data else 1,
+            amount=ingestion_data.amount if ingestion_data else None,
+            total_due=ingestion_data.amount_plus_fee if ingestion_data else None,
+            message_content=message,
+            prompt_used=None,
+            model="manual_dashboard",
+            status=MessagesOutbound.Status.SENT,
+            provider="icollector",
+            provider_response=result,
+            provider_message_id=sms_message_id,
+            sent_at=timezone.now(),
+        )
+    except DataError:
+        return JsonResponse(
+            {
+                "status": "failed",
+                "error": "SMS was sent but outbound logging failed due to field length limits.",
+            },
+            status=500,
+        )
+
+    if ingestion_data:
+        ingestion_data.message_sent = True
+        ingestion_data.message_generated = True
+        ingestion_data.last_message_at = timezone.now()
+        ingestion_data.save(update_fields=["message_sent", "message_generated", "last_message_at", "updated_at"])
 
     return JsonResponse(
         {
             "status": "success",
-            "row_id": row_id,
+            "row_id": row_id_int,
             "phone": phone,
+            "outbound_id": outbound.id,
             "gateway_result": result,
         }
     )
@@ -535,7 +596,7 @@ def superadmin_dashboard_send_email(request):
         body = {}
 
     row_id = body.get("row_id")
-    to_email = str(body.get("to_email") or body.get("email") or "").strip()
+    to_email = _truncate_text(body.get("to_email") or body.get("email"), 254)
     subject = str(body.get("subject") or "Account Update").strip()
     message = str(body.get("message") or body.get("body") or "").strip()
 
@@ -546,18 +607,76 @@ def superadmin_dashboard_send_email(request):
     if not message:
         return JsonResponse({"status": "failed", "error": "message is required."}, status=400)
 
+    try:
+        row_id_int = int(row_id)
+    except (TypeError, ValueError):
+        return JsonResponse({"status": "failed", "error": "row_id must be numeric."}, status=400)
+
+    crm_data = CRMData.objects.filter(row_id=row_id_int).first()
+    ingestion_data = IngestionData.objects.filter(row_id=row_id_int).first()
+    borrower_name = (
+        (ingestion_data.borrower if ingestion_data and ingestion_data.borrower else None)
+        or (crm_data.client if crm_data and crm_data.client else None)
+        or "Unknown"
+    )
+
     client = ICollectorClient()
     try:
-        result = client.send_email(row_id=str(row_id), to_email=to_email, subject=subject, body=message)
+        result = client.send_email(row_id=str(row_id_int), to_email=to_email, subject=subject, body=message)
     except ICollectorClientError as exc:
         return JsonResponse({"status": "failed", "error": str(exc)}, status=502)
+
+    email_message_id = None
+    if isinstance(result, dict):
+        email_message_id = (
+            (result.get("email_log", {}) or {}).get("message_id")
+            or result.get("message_id")
+            or result.get("id")
+        )
+    email_message_id = _truncate_text(email_message_id, 100) or None
+
+    try:
+        outbound = MessagesOutbound.objects.create(
+            crm_data=crm_data,
+            ingestion_data=ingestion_data,
+            row_id=row_id_int,
+            borrower_name=_truncate_text(borrower_name, 255),
+            email=to_email,
+            channel=MessagesOutbound.Channel.EMAIL,
+            wave=ingestion_data.wave if ingestion_data else 1,
+            amount=ingestion_data.amount if ingestion_data else None,
+            total_due=ingestion_data.amount_plus_fee if ingestion_data else None,
+            message_content=message,
+            prompt_used=None,
+            model="manual_dashboard",
+            status=MessagesOutbound.Status.SENT,
+            provider="icollector",
+            provider_response=result,
+            provider_message_id=email_message_id,
+            sent_at=timezone.now(),
+        )
+    except DataError:
+        return JsonResponse(
+            {
+                "status": "failed",
+                "error": "Email was sent but outbound logging failed due to field length limits.",
+            },
+            status=500,
+        )
+
+    if ingestion_data:
+        ingestion_data.message_sent = True
+        ingestion_data.message_generated = True
+        ingestion_data.last_message_at = timezone.now()
+        ingestion_data.save(update_fields=["message_sent", "message_generated", "last_message_at", "updated_at"])
 
     return JsonResponse(
         {
             "status": "success",
-            "row_id": row_id,
+            "row_id": row_id_int,
             "to_email": to_email,
             "subject": subject,
+            "outbound_id": outbound.id,
             "gateway_result": result,
         }
     )
