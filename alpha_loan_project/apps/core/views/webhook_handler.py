@@ -37,11 +37,11 @@ _processed_events = set()
 MAX_CACHED_EVENTS = 10000
 DAILY_REJECT_BOARD_ID = 70
 DAILY_REJECT_GROUP_ID = 91
+_AUTO_REPLY_MODES = {"all", "allowlist", "off"}
 _PHONE_DIGITS_RE = re.compile(r"\D")
 _PLACEHOLDER_PATTERN = re.compile(r"\[[^\]]+\]")
 _CALL_US_PATTERN = re.compile(r"\bcall\s+us\b[^.!?]*[.!?]?", re.IGNORECASE)
 _FORMAL_PHRASE_PATTERN = re.compile(r"\b(please remit|to resolve|current balance is)\b", re.IGNORECASE)
-_MANUAL_OUTBOUND_MODELS = ("manual_dashboard", "manual_row_lookup")
 
 
 def _verify_signature(request) -> bool:
@@ -162,6 +162,97 @@ def _safe_decimal(value: object) -> Optional[Decimal]:
         return None
 
 
+def _to_bool(value: object, default: bool = True) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "y", "on"}:
+        return True
+    if text in {"0", "false", "no", "n", "off"}:
+        return False
+    return default
+
+
+def _parse_allowed_row_ids(raw: object) -> set[int]:
+    if raw is None:
+        return set()
+    if isinstance(raw, str):
+        candidates = [item.strip() for item in raw.split(",")]
+    elif isinstance(raw, (list, tuple, set)):
+        candidates = list(raw)
+    else:
+        candidates = [raw]
+
+    allowed: set[int] = set()
+    for item in candidates:
+        if item in (None, "", "null"):
+            continue
+        try:
+            allowed.add(int(str(item).strip()))
+        except (TypeError, ValueError):
+            continue
+    return allowed
+
+
+def _get_auto_reply_mode() -> str:
+    mode = str(getattr(settings, "AUTO_REPLY_MODE", "all")).strip().lower()
+    return mode if mode in _AUTO_REPLY_MODES else "all"
+
+
+def _evaluate_auto_reply_gate(channel: str, row_id: Optional[int]) -> Optional[Dict[str, str]]:
+    channel_enabled = _to_bool(
+        getattr(settings, f"AUTO_REPLY_{channel.upper()}_ENABLED", True),
+        default=True,
+    )
+    if not channel_enabled:
+        return {
+            "reason": "channel_disabled",
+            "note": f"Auto-reply skipped: {channel} channel disabled by config.",
+        }
+
+    mode = _get_auto_reply_mode()
+    if mode == "off":
+        return {
+            "reason": "auto_reply_off",
+            "note": "Auto-reply skipped: AUTO_REPLY_MODE=off.",
+        }
+
+    if mode == "allowlist":
+        allowed_rows = _parse_allowed_row_ids(getattr(settings, "AUTO_REPLY_ALLOWED_ROW_IDS", ""))
+        if not allowed_rows:
+            return {
+                "reason": "allowlist_empty",
+                "note": "Auto-reply skipped: allowlist mode enabled but no row IDs configured.",
+            }
+        if row_id is None:
+            return {
+                "reason": "pilot_gate_row_id_missing",
+                "note": "Auto-reply skipped: allowlist mode requires row_id match.",
+            }
+        if int(row_id) not in allowed_rows:
+            return {
+                "reason": "pilot_gate",
+                "note": f"Auto-reply skipped: row_id {row_id} not in allowlist.",
+            }
+
+    return None
+
+
+def _skip_auto_reply(
+    inbound: MessagesInbound,
+    *,
+    reason: str,
+    note: str,
+    requires_human: bool = False,
+) -> Dict[str, str]:
+    inbound.requires_human = requires_human
+    inbound.human_notes = note
+    inbound.save(update_fields=["requires_human", "human_notes", "updated_at"])
+    return {"status": "skipped", "reason": reason}
+
+
 def _truncate_text(value: object, max_length: int) -> str:
     """Coerce to string and cap length for DB-bound fields."""
     if value is None:
@@ -261,56 +352,6 @@ def _is_daily_reject_related(related: Dict[str, object]) -> bool:
         )
     except (TypeError, ValueError):
         return False
-
-
-def _has_manual_sms_opt_in(related: Dict[str, object]) -> bool:
-    """
-    Allow SMS auto-reply only for threads with prior manual outbound sends.
-
-    Manual sends are identified from dashboard/row-lookup markers, plus legacy
-    rows where prompt_used is empty/null (historical manual sends).
-    """
-    manual_qs = MessagesOutbound.objects.filter(
-        channel=MessagesOutbound.Channel.SMS
-    ).filter(
-        Q(model__in=_MANUAL_OUTBOUND_MODELS)
-        | Q(prompt_used__isnull=True)
-        | Q(prompt_used__exact="")
-    )
-
-    row_id = _parse_row_id(related.get("row_id"))
-    if row_id is not None and manual_qs.filter(row_id=row_id).exists():
-        return True
-
-    normalized_phone = str(related.get("normalized_phone") or "")
-    phone_tail = _digits_tail(normalized_phone)
-    if phone_tail and manual_qs.filter(phone__icontains=phone_tail).exists():
-        return True
-
-    return False
-
-
-def _has_manual_email_opt_in(related: Dict[str, object]) -> bool:
-    """
-    Allow email auto-reply only for threads with prior manual outbound sends.
-    """
-    manual_qs = MessagesOutbound.objects.filter(
-        channel=MessagesOutbound.Channel.EMAIL
-    ).filter(
-        Q(model__in=_MANUAL_OUTBOUND_MODELS)
-        | Q(prompt_used__isnull=True)
-        | Q(prompt_used__exact="")
-    )
-
-    row_id = _parse_row_id(related.get("row_id"))
-    if row_id is not None and manual_qs.filter(row_id=row_id).exists():
-        return True
-
-    normalized_email = _normalize_email(str(related.get("normalized_email") or ""))
-    if normalized_email and manual_qs.filter(email__iexact=normalized_email).exists():
-        return True
-
-    return False
 
 
 def _find_related_records(phone: str, row_id: int = None, received_at: Optional[datetime] = None):
@@ -630,28 +671,40 @@ def _build_email_reply_prompt(
 
 def _maybe_auto_reply_to_inbound(inbound: MessagesInbound, payload: Dict[str, object], related: Dict[str, object]) -> Dict[str, object]:
     """Auto-generate and send reply for Daily Reject inbound SMS when safely matched."""
-    if not _is_daily_reject_related(related):
-        return {"status": "skipped", "reason": "out_of_scope"}
-
-    if not _has_manual_sms_opt_in(related):
-        inbound.requires_human = True
-        inbound.human_notes = "Auto-reply skipped: no prior manual outbound SMS found for this row/client."
-        inbound.save(update_fields=["requires_human", "human_notes", "updated_at"])
-        return {"status": "skipped", "reason": "manual_opt_in_missing"}
-
     row_id = related.get("row_id")
+    gate = _evaluate_auto_reply_gate("sms", row_id=row_id)
+    if gate:
+        return _skip_auto_reply(
+            inbound,
+            reason=gate["reason"],
+            note=gate["note"],
+            requires_human=False,
+        )
+
+    if not _is_daily_reject_related(related):
+        return _skip_auto_reply(
+            inbound,
+            reason="out_of_scope",
+            note="Auto-reply skipped: out_of_scope (row not in Daily Reject scope).",
+            requires_human=False,
+        )
+
     if row_id is None:
-        inbound.requires_human = True
-        inbound.human_notes = "Daily Reject scope matched but row_id missing for safe auto-reply."
-        inbound.save(update_fields=["requires_human", "human_notes", "updated_at"])
-        return {"status": "skipped", "reason": "row_id_missing"}
+        return _skip_auto_reply(
+            inbound,
+            reason="row_id_missing",
+            note="Daily Reject scope matched but row_id missing for safe auto-reply.",
+            requires_human=True,
+        )
 
     normalized_phone = related.get("normalized_phone") or _normalize_phone(inbound.from_phone)
     if not _phone_matches_related(str(normalized_phone or ""), related):
-        inbound.requires_human = True
-        inbound.human_notes = "Phone mismatch against related client records; auto-reply skipped."
-        inbound.save(update_fields=["requires_human", "human_notes", "updated_at"])
-        return {"status": "skipped", "reason": "phone_mismatch"}
+        return _skip_auto_reply(
+            inbound,
+            reason="phone_mismatch",
+            note="Phone mismatch against related client records; auto-reply skipped.",
+            requires_human=True,
+        )
 
     context = _extract_reply_context(related)
     previous_outbound = related.get("outbound_message")
@@ -783,30 +836,40 @@ def _maybe_auto_reply_to_inbound_email(
     related: Dict[str, object],
 ) -> Dict[str, object]:
     """Auto-generate and send reply for Daily Reject inbound email when safely matched."""
-    if not _is_daily_reject_related(related):
-        inbound.human_notes = "Auto-reply skipped: out_of_scope (row not in Daily Reject scope)."
-        inbound.save(update_fields=["human_notes", "updated_at"])
-        return {"status": "skipped", "reason": "out_of_scope"}
-
-    if not _has_manual_email_opt_in(related):
-        inbound.requires_human = True
-        inbound.human_notes = "Email auto-reply skipped: no prior manual outbound email found for this row/client."
-        inbound.save(update_fields=["requires_human", "human_notes", "updated_at"])
-        return {"status": "skipped", "reason": "manual_opt_in_missing"}
-
     row_id = related.get("row_id")
+    gate = _evaluate_auto_reply_gate("email", row_id=row_id)
+    if gate:
+        return _skip_auto_reply(
+            inbound,
+            reason=gate["reason"],
+            note=gate["note"],
+            requires_human=False,
+        )
+
+    if not _is_daily_reject_related(related):
+        return _skip_auto_reply(
+            inbound,
+            reason="out_of_scope",
+            note="Auto-reply skipped: out_of_scope (row not in Daily Reject scope).",
+            requires_human=False,
+        )
+
     if row_id is None:
-        inbound.requires_human = True
-        inbound.human_notes = "Daily Reject scope matched but row_id missing for safe email auto-reply."
-        inbound.save(update_fields=["requires_human", "human_notes", "updated_at"])
-        return {"status": "skipped", "reason": "row_id_missing"}
+        return _skip_auto_reply(
+            inbound,
+            reason="row_id_missing",
+            note="Daily Reject scope matched but row_id missing for safe email auto-reply.",
+            requires_human=True,
+        )
 
     normalized_email = related.get("normalized_email") or _normalize_email(inbound.from_email)
     if not _email_matches_related(str(normalized_email or ""), related):
-        inbound.requires_human = True
-        inbound.human_notes = "Email mismatch against related client records; auto-reply skipped."
-        inbound.save(update_fields=["requires_human", "human_notes", "updated_at"])
-        return {"status": "skipped", "reason": "email_mismatch"}
+        return _skip_auto_reply(
+            inbound,
+            reason="email_mismatch",
+            note="Email mismatch against related client records; auto-reply skipped.",
+            requires_human=True,
+        )
 
     context = _extract_reply_context(related)
     previous_outbound = related.get("outbound_message")
