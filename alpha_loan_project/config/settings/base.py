@@ -168,6 +168,12 @@ ICOLLECTOR_TENANT = os.getenv('ICOLLECTOR_TENANT', '')
 ICOLLECTOR_INBOUND_SECRET = os.getenv('ICOLLECTOR_INBOUND_SECRET', '')
 ICOLLECTOR_OUTBOUND_SECRET = os.getenv('ICOLLECTOR_OUTBOUND_SECRET', '')
 
+# Auto-reply gate (webhook inbound replies)
+AUTO_REPLY_MODE = os.getenv('AUTO_REPLY_MODE', 'all').strip().lower()
+AUTO_REPLY_ALLOWED_ROW_IDS = os.getenv('AUTO_REPLY_ALLOWED_ROW_IDS', '')
+AUTO_REPLY_SMS_ENABLED = os.getenv('AUTO_REPLY_SMS_ENABLED', 'True').strip().lower() in {'1', 'true', 'yes', 'on'}
+AUTO_REPLY_EMAIL_ENABLED = os.getenv('AUTO_REPLY_EMAIL_ENABLED', 'True').strip().lower() in {'1', 'true', 'yes', 'on'}
+
 # Collections policy and memory controls
 COLLECTION_MEMORY_MAX_MESSAGES = int(os.getenv('COLLECTION_MEMORY_MAX_MESSAGES', '8'))
 COLLECTION_HISTORY_MAX_CASES = int(os.getenv('COLLECTION_HISTORY_MAX_CASES', '5'))
