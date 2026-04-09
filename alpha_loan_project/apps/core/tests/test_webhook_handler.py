@@ -70,7 +70,15 @@ class ICollectorWebhookAutoReplyTests(TestCase):
             sent_at=timezone.now(),
         )
 
-    def _create_prior_outbound_email(self, *, row_id: int, email: str, message: str) -> MessagesOutbound:
+    def _create_prior_outbound_email(
+        self,
+        *,
+        row_id: int,
+        email: str,
+        message: str,
+        provider_message_id: str = "",
+        provider_response=None,
+    ) -> MessagesOutbound:
         return MessagesOutbound.objects.create(
             row_id=row_id,
             borrower_name="John Doe",
@@ -83,6 +91,8 @@ class ICollectorWebhookAutoReplyTests(TestCase):
             message_content=message,
             status=MessagesOutbound.Status.SENT,
             provider="icollector",
+            provider_message_id=provider_message_id or None,
+            provider_response=provider_response,
             sent_at=timezone.now(),
         )
 
@@ -107,17 +117,23 @@ class ICollectorWebhookAutoReplyTests(TestCase):
         message: str,
         from_email: str = "john@example.com",
         occurred_at=None,
+        subject: str = "Account Update",
+        extra_data=None,
     ):
+        data = {
+            "from_email": from_email,
+            "body": message,
+            "row_id": row_id,
+            "message_id": f"provider-email-{event_id}",
+            "subject": subject,
+        }
+        if extra_data:
+            data.update(extra_data)
         return {
             "event_id": event_id,
             "event": "email.received",
             "occurred_at": (occurred_at or (timezone.now() + timedelta(seconds=10))).isoformat(),
-            "data": {
-                "from_email": from_email,
-                "body": message,
-                "row_id": row_id,
-                "message_id": f"provider-email-{event_id}",
-            },
+            "data": data,
         }
 
     def test_daily_reject_inbound_triggers_autoreply_with_message_pair_context(self):
@@ -352,6 +368,112 @@ class ICollectorWebhookAutoReplyTests(TestCase):
         self.assertTrue(ingestion.message_generated)
         self.assertTrue(ingestion.message_sent)
         self.assertIsNotNone(ingestion.last_message_at)
+
+    def test_daily_reject_email_autoreply_passes_thread_metadata_to_gateway(self):
+        self._create_crm_and_ingestion(row_id=72011, email="john@example.com")
+        self._create_prior_outbound_email(
+            row_id=72011,
+            email="john@example.com",
+            message="John, this is Mike from ilowns. Please confirm your stop-payment status by 2pm EST today.",
+            provider_message_id="<prior-1@icollector.ai>",
+            provider_response={
+                "email_log": {
+                    "message_id": "<prior-1@icollector.ai>",
+                    "thread_id": "thread-abc",
+                    "mailbox_role": "collections",
+                    "connection_id": 17,
+                }
+            },
+        )
+
+        inbound_message_id = "<inbound-2@client.example>"
+        payload = self._email_payload(
+            event_id="evt-email-thread-1",
+            row_id=72011,
+            message="i can pay this evening",
+            subject="Re: Account Update",
+            extra_data={
+                "message_id": inbound_message_id,
+                "thread_id": "thread-abc",
+                "mailbox_role": "collections",
+                "connection_id": 17,
+                "references": ["<prior-1@icollector.ai>"],
+            },
+        )
+
+        with patch(
+            "apps.core.views.webhook_handler.ICollectorClient.generate_collection_llm",
+            return_value={
+                "answer": "John,\n\nPlease confirm the exact payment time this evening.\n\nThank you.",
+                "model": "collections-gateway",
+            },
+        ), patch(
+            "apps.core.views.webhook_handler.ICollectorClient.send_email_extended",
+            return_value={"status": "success", "message_id": "email-thread-1"},
+        ) as mock_send:
+            response = self.api_client.post("/api/webhooks/icollector/", payload, format="json")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(mock_send.call_count, 1)
+        kwargs = mock_send.call_args.kwargs
+        self.assertEqual(kwargs["subject"], "Re: Account Update")
+        self.assertEqual(kwargs["mailbox_role"], "collections")
+        self.assertEqual(kwargs["connection_id"], 17)
+        self.assertIn("threading", kwargs)
+        threading = kwargs["threading"]
+        self.assertEqual(threading.get("thread_id"), "thread-abc")
+        self.assertEqual(threading.get("in_reply_to_message_id"), inbound_message_id)
+        self.assertEqual(threading.get("reply_to_message_id"), inbound_message_id)
+        self.assertEqual(threading.get("in_reply_to"), inbound_message_id)
+        self.assertIn("<prior-1@icollector.ai>", threading.get("references", []))
+        self.assertIn(inbound_message_id, threading.get("references", []))
+
+    def test_email_threading_validation_error_retries_with_basic_payload(self):
+        self._create_crm_and_ingestion(row_id=72012, email="john@example.com")
+        self._create_prior_outbound_email(
+            row_id=72012,
+            email="john@example.com",
+            message="Please confirm when this will be handled.",
+            provider_message_id="<prior-2@icollector.ai>",
+            provider_response={"email_log": {"thread_id": "thread-fallback", "connection_id": 19}},
+        )
+
+        payload = self._email_payload(
+            event_id="evt-email-thread-2",
+            row_id=72012,
+            message="i will update soon",
+            subject="Re: Account Update",
+            extra_data={
+                "message_id": "<inbound-3@client.example>",
+                "thread_id": "thread-fallback",
+                "mailbox_role": "collections",
+                "connection_id": 19,
+            },
+        )
+
+        with patch(
+            "apps.core.views.webhook_handler.ICollectorClient.generate_collection_llm",
+            return_value={"answer": "Please confirm exact timing today.", "model": "collections-gateway"},
+        ), patch(
+            "apps.core.views.webhook_handler.ICollectorClient.send_email_extended",
+            side_effect=[
+                ICollectorClientError("400 Client Error: Bad Request | detail=Unknown field: thread_id"),
+                {"status": "success", "message_id": "email-thread-2"},
+            ],
+        ) as mock_send:
+            response = self.api_client.post("/api/webhooks/icollector/", payload, format="json")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["result"]["auto_reply"]["status"], "sent")
+        self.assertEqual(mock_send.call_count, 2)
+        first_kwargs = mock_send.call_args_list[0].kwargs
+        second_kwargs = mock_send.call_args_list[1].kwargs
+        self.assertIn("threading", first_kwargs)
+        self.assertIn("mailbox_role", first_kwargs)
+        self.assertIn("connection_id", first_kwargs)
+        self.assertNotIn("threading", second_kwargs)
+        self.assertNotIn("mailbox_role", second_kwargs)
+        self.assertNotIn("connection_id", second_kwargs)
 
     def test_non_daily_reject_email_row_stores_inbound_only(self):
         self._create_crm_and_ingestion(row_id=72002, board_id=71, group_id=91, email="john@example.com")

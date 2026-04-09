@@ -260,6 +260,163 @@ def _truncate_text(value: object, max_length: int) -> str:
     return str(value).strip()[:max_length]
 
 
+def _first_non_empty_text(*values: object, max_length: int = 255) -> str:
+    for value in values:
+        text = _truncate_text(value, max_length)
+        if text:
+            return text
+    return ""
+
+
+def _to_int(value: object) -> Optional[int]:
+    if value in (None, "", "null"):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _dig(mapping: object, *path: str) -> object:
+    current = mapping
+    for key in path:
+        if not isinstance(current, dict):
+            return None
+        current = current.get(key)
+    return current
+
+
+def _normalize_references(raw: object) -> list[str]:
+    if raw in (None, ""):
+        return []
+
+    if isinstance(raw, str):
+        candidates = [item for item in re.split(r"[\s,]+", raw.strip()) if item]
+    elif isinstance(raw, (list, tuple, set)):
+        candidates = [_truncate_text(item, 255) for item in raw]
+    else:
+        candidates = [_truncate_text(raw, 255)]
+
+    normalized: list[str] = []
+    for item in candidates:
+        text = _truncate_text(item, 255)
+        if text and text not in normalized:
+            normalized.append(text)
+    return normalized
+
+
+def _extract_email_reply_subject(payload: Dict[str, object], previous_outbound: Optional[MessagesOutbound]) -> str:
+    data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+    provider_response = getattr(previous_outbound, "provider_response", None) if previous_outbound else None
+    subject = _first_non_empty_text(
+        data.get("subject") if isinstance(data, dict) else "",
+        data.get("email_subject") if isinstance(data, dict) else "",
+        _dig(provider_response, "email_log", "subject"),
+        _dig(provider_response, "subject"),
+        max_length=255,
+    )
+    return subject or "Account Update"
+
+
+def _extract_email_send_options(
+    *,
+    payload: Dict[str, object],
+    inbound: MessagesInbound,
+    related: Dict[str, object],
+) -> Dict[str, object]:
+    data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+    previous_outbound = related.get("outbound_message")
+    provider_response = getattr(previous_outbound, "provider_response", None) if previous_outbound else None
+
+    inbound_message_id = _first_non_empty_text(
+        data.get("message_id") if isinstance(data, dict) else "",
+        data.get("email_id") if isinstance(data, dict) else "",
+        inbound.provider_message_id,
+        max_length=255,
+    )
+    previous_message_id = _first_non_empty_text(
+        _dig(provider_response, "email_log", "message_id"),
+        _dig(provider_response, "message_id"),
+        getattr(previous_outbound, "provider_message_id", ""),
+        max_length=255,
+    )
+    thread_id = _first_non_empty_text(
+        data.get("thread_id") if isinstance(data, dict) else "",
+        data.get("conversation_id") if isinstance(data, dict) else "",
+        data.get("email_thread_id") if isinstance(data, dict) else "",
+        _dig(provider_response, "email_log", "thread_id"),
+        _dig(provider_response, "thread_id"),
+        max_length=255,
+    )
+    mailbox_role = _first_non_empty_text(
+        data.get("mailbox_role") if isinstance(data, dict) else "",
+        _dig(provider_response, "email_log", "mailbox_role"),
+        _dig(provider_response, "mailbox_role"),
+        max_length=64,
+    )
+
+    raw_connection_id = _first_non_empty_text(
+        data.get("connection_id") if isinstance(data, dict) else "",
+        _dig(provider_response, "email_log", "connection_id"),
+        _dig(provider_response, "connection_id"),
+        max_length=32,
+    )
+    connection_id = _to_int(raw_connection_id)
+
+    parent_message_id = inbound_message_id or _first_non_empty_text(
+        data.get("in_reply_to_message_id") if isinstance(data, dict) else "",
+        data.get("in_reply_to") if isinstance(data, dict) else "",
+        data.get("parent_message_id") if isinstance(data, dict) else "",
+        previous_message_id,
+        max_length=255,
+    )
+
+    references = []
+    if isinstance(data, dict):
+        references.extend(_normalize_references(data.get("references")))
+        references.extend(_normalize_references(data.get("email_references")))
+    references.extend(_normalize_references(previous_message_id))
+    references.extend(_normalize_references(parent_message_id))
+
+    threading: Dict[str, object] = {}
+    if thread_id:
+        threading["thread_id"] = thread_id
+    if parent_message_id:
+        # Send multiple common aliases used by provider implementations.
+        threading["in_reply_to_message_id"] = parent_message_id
+        threading["reply_to_message_id"] = parent_message_id
+        threading["in_reply_to"] = parent_message_id
+    if references:
+        threading["references"] = references
+
+    options: Dict[str, object] = {}
+    if mailbox_role:
+        options["mailbox_role"] = mailbox_role
+    if connection_id is not None:
+        options["connection_id"] = connection_id
+    if threading:
+        options["threading"] = threading
+    return options
+
+
+def _is_email_payload_validation_error(exc: Exception) -> bool:
+    message = str(exc).lower()
+    if "400" not in message:
+        return False
+    return any(
+        marker in message
+        for marker in (
+            "unknown field",
+            "unexpected field",
+            "extra fields",
+            "not allowed",
+            "invalid payload",
+            "validation",
+            "bad request",
+        )
+    )
+
+
 def _extract_decimal_from_mixed(value: object) -> Optional[Decimal]:
     if isinstance(value, dict):
         for key in ("raw", "value", "amount", "text"):
@@ -912,19 +1069,44 @@ def _maybe_auto_reply_to_inbound_email(
         inbound.save(update_fields=["requires_human", "human_notes", "updated_at"])
         return {"status": "skipped", "reason": "email_missing"}
 
+    reply_subject = _extract_email_reply_subject(payload, previous_outbound)
+    send_options = _extract_email_send_options(payload=payload, inbound=inbound, related=related)
+    send_idempotency_key = f"reply-email-send-{idempotency_prefix}-{inbound.id}"[:120]
+
     try:
         send_result = client.send_email_extended(
             row_id=str(row_id),
             to_email=recipient_email,
-            subject="Account Update",
+            subject=reply_subject,
             body=final_message,
-            idempotency_key=f"reply-email-send-{idempotency_prefix}-{inbound.id}"[:120],
+            idempotency_key=send_idempotency_key,
+            **send_options,
         )
     except ICollectorClientError as exc:
-        inbound.requires_human = True
-        inbound.human_notes = f"Email send failed: {exc}"
-        inbound.save(update_fields=["requires_human", "human_notes", "updated_at"])
-        return {"status": "failed", "reason": "send_error", "error": str(exc)}
+        if send_options and _is_email_payload_validation_error(exc):
+            logger.warning(
+                "Email send payload rejected with threading metadata; retrying basic send. row_id=%s error=%s",
+                row_id,
+                exc,
+            )
+            try:
+                send_result = client.send_email_extended(
+                    row_id=str(row_id),
+                    to_email=recipient_email,
+                    subject=reply_subject,
+                    body=final_message,
+                    idempotency_key=send_idempotency_key,
+                )
+            except ICollectorClientError as retry_exc:
+                inbound.requires_human = True
+                inbound.human_notes = f"Email send failed: {retry_exc}"
+                inbound.save(update_fields=["requires_human", "human_notes", "updated_at"])
+                return {"status": "failed", "reason": "send_error", "error": str(retry_exc)}
+        else:
+            inbound.requires_human = True
+            inbound.human_notes = f"Email send failed: {exc}"
+            inbound.save(update_fields=["requires_human", "human_notes", "updated_at"])
+            return {"status": "failed", "reason": "send_error", "error": str(exc)}
 
     outbound = MessagesOutbound.objects.create(
         crm_data=related.get("crm_data"),

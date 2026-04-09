@@ -211,6 +211,7 @@ class ICollectorClient:
         connection_id: Optional[int] = None,
         cc: Optional[List[str]] = None,
         idempotency_key: Optional[str] = None,
+        threading: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         payload: Dict[str, Any] = {
             "row_id": row_id,
@@ -226,6 +227,11 @@ class ICollectorClient:
             payload["cc"] = cc
         if idempotency_key:
             payload["idempotency_key"] = idempotency_key
+        if threading:
+            for key, value in threading.items():
+                if value in (None, "", [], {}, ()):
+                    continue
+                payload[key] = value
         return self.request("POST", "/api/partner-gateway/v1/email/send/", body=payload)
 
     def get_boards(self) -> Dict[str, Any]:
