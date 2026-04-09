@@ -315,7 +315,7 @@ def _extract_email_reply_subject(payload: Dict[str, object], previous_outbound: 
         _dig(provider_response, "subject"),
         max_length=255,
     )
-    return subject or "Account Update"
+    return subject or "Re: Account Update"
 
 
 def _extract_email_send_options(
@@ -331,42 +331,66 @@ def _extract_email_send_options(
     inbound_message_id = _first_non_empty_text(
         data.get("message_id") if isinstance(data, dict) else "",
         data.get("email_id") if isinstance(data, dict) else "",
+        data.get("internet_message_id") if isinstance(data, dict) else "",
+        data.get("provider_message_id") if isinstance(data, dict) else "",
+        data.get("external_id") if isinstance(data, dict) else "",
+        _dig(data, "headers", "message-id"),
+        _dig(data, "headers", "message_id"),
+        _dig(data, "headers", "Message-ID"),
         inbound.provider_message_id,
         max_length=255,
     )
     previous_message_id = _first_non_empty_text(
         _dig(provider_response, "email_log", "message_id"),
+        _dig(provider_response, "email_log", "internet_message_id"),
         _dig(provider_response, "message_id"),
         getattr(previous_outbound, "provider_message_id", ""),
         max_length=255,
     )
     thread_id = _first_non_empty_text(
         data.get("thread_id") if isinstance(data, dict) else "",
+        data.get("thread") if isinstance(data, dict) else "",
+        data.get("threadId") if isinstance(data, dict) else "",
         data.get("conversation_id") if isinstance(data, dict) else "",
+        data.get("conversationId") if isinstance(data, dict) else "",
         data.get("email_thread_id") if isinstance(data, dict) else "",
         _dig(provider_response, "email_log", "thread_id"),
+        _dig(provider_response, "email_log", "conversation_id"),
         _dig(provider_response, "thread_id"),
+        _dig(provider_response, "conversation_id"),
         max_length=255,
     )
     mailbox_role = _first_non_empty_text(
         data.get("mailbox_role") if isinstance(data, dict) else "",
+        data.get("mailbox") if isinstance(data, dict) else "",
         _dig(provider_response, "email_log", "mailbox_role"),
+        _dig(provider_response, "email_log", "mailbox"),
         _dig(provider_response, "mailbox_role"),
+        _dig(provider_response, "mailbox"),
         max_length=64,
     )
 
     raw_connection_id = _first_non_empty_text(
         data.get("connection_id") if isinstance(data, dict) else "",
+        data.get("mailbox_connection_id") if isinstance(data, dict) else "",
         _dig(provider_response, "email_log", "connection_id"),
+        _dig(provider_response, "email_log", "mailbox_connection_id"),
         _dig(provider_response, "connection_id"),
+        _dig(provider_response, "mailbox_connection_id"),
         max_length=32,
     )
     connection_id = _to_int(raw_connection_id)
 
     parent_message_id = inbound_message_id or _first_non_empty_text(
         data.get("in_reply_to_message_id") if isinstance(data, dict) else "",
+        data.get("reply_to_message_id") if isinstance(data, dict) else "",
         data.get("in_reply_to") if isinstance(data, dict) else "",
+        data.get("inReplyTo") if isinstance(data, dict) else "",
+        data.get("reply_to") if isinstance(data, dict) else "",
         data.get("parent_message_id") if isinstance(data, dict) else "",
+        _dig(data, "headers", "in-reply-to"),
+        _dig(data, "headers", "In-Reply-To"),
+        _dig(data, "headers", "in_reply_to"),
         previous_message_id,
         max_length=255,
     )
@@ -375,19 +399,28 @@ def _extract_email_send_options(
     if isinstance(data, dict):
         references.extend(_normalize_references(data.get("references")))
         references.extend(_normalize_references(data.get("email_references")))
+        references.extend(_normalize_references(_dig(data, "headers", "references")))
+        references.extend(_normalize_references(_dig(data, "headers", "References")))
     references.extend(_normalize_references(previous_message_id))
     references.extend(_normalize_references(parent_message_id))
 
     threading: Dict[str, object] = {}
     if thread_id:
         threading["thread_id"] = thread_id
+        threading["threadId"] = thread_id
+        threading["conversation_id"] = thread_id
+        threading["conversationId"] = thread_id
     if parent_message_id:
         # Send multiple common aliases used by provider implementations.
         threading["in_reply_to_message_id"] = parent_message_id
         threading["reply_to_message_id"] = parent_message_id
         threading["in_reply_to"] = parent_message_id
+        threading["inReplyTo"] = parent_message_id
+        threading["parent_message_id"] = parent_message_id
+        threading["reply_to"] = parent_message_id
     if references:
         threading["references"] = references
+        threading["email_references"] = references
 
     options: Dict[str, object] = {}
     if mailbox_role:
@@ -397,6 +430,78 @@ def _extract_email_send_options(
     if threading:
         options["threading"] = threading
     return options
+
+
+def _build_email_send_option_variants(send_options: Dict[str, object]) -> list[Dict[str, object]]:
+    """
+    Build ordered retry variants from most-specific thread metadata to basic payload.
+    This keeps best-effort threading even when provider rejects some optional keys.
+    """
+    variants: list[Dict[str, object]] = []
+    seen: set[str] = set()
+
+    mailbox_role = send_options.get("mailbox_role")
+    connection_id = send_options.get("connection_id")
+    threading_raw = send_options.get("threading")
+    threading = threading_raw if isinstance(threading_raw, dict) else {}
+
+    def _build_variant(threading_payload: Optional[Dict[str, object]]) -> Dict[str, object]:
+        variant: Dict[str, object] = {}
+        if mailbox_role:
+            variant["mailbox_role"] = mailbox_role
+        if connection_id is not None:
+            variant["connection_id"] = connection_id
+        if threading_payload:
+            variant["threading"] = threading_payload
+        return variant
+
+    def _append_variant(variant: Dict[str, object]) -> None:
+        key = json.dumps(variant, sort_keys=True, default=str)
+        if key not in seen:
+            seen.add(key)
+            variants.append(variant)
+
+    _append_variant(send_options or {})
+
+    if threading:
+        canonical_threading = {
+            key: threading[key]
+            for key in ("thread_id", "in_reply_to_message_id", "references")
+            if key in threading
+        }
+        if canonical_threading:
+            _append_variant(_build_variant(canonical_threading))
+
+        no_thread_id = {
+            key: threading[key]
+            for key in (
+                "in_reply_to_message_id",
+                "reply_to_message_id",
+                "in_reply_to",
+                "inReplyTo",
+                "parent_message_id",
+                "reply_to",
+                "references",
+            )
+            if key in threading
+        }
+        if no_thread_id:
+            _append_variant(_build_variant(no_thread_id))
+
+        thread_only = {
+            key: threading[key]
+            for key in ("thread_id", "threadId", "conversation_id", "conversationId")
+            if key in threading
+        }
+        if thread_only:
+            _append_variant(_build_variant(thread_only))
+
+    routing_only = _build_variant(None)
+    if routing_only:
+        _append_variant(routing_only)
+
+    _append_variant({})
+    return variants
 
 
 def _is_email_payload_validation_error(exc: Exception) -> bool:
@@ -1072,41 +1177,49 @@ def _maybe_auto_reply_to_inbound_email(
     reply_subject = _extract_email_reply_subject(payload, previous_outbound)
     send_options = _extract_email_send_options(payload=payload, inbound=inbound, related=related)
     send_idempotency_key = f"reply-email-send-{idempotency_prefix}-{inbound.id}"[:120]
+    send_option_variants = _build_email_send_option_variants(send_options)
+    send_result = None
+    last_send_error: Optional[ICollectorClientError] = None
 
-    try:
-        send_result = client.send_email_extended(
-            row_id=str(row_id),
-            to_email=recipient_email,
-            subject=reply_subject,
-            body=final_message,
-            idempotency_key=send_idempotency_key,
-            **send_options,
-        )
-    except ICollectorClientError as exc:
-        if send_options and _is_email_payload_validation_error(exc):
-            logger.warning(
-                "Email send payload rejected with threading metadata; retrying basic send. row_id=%s error=%s",
-                row_id,
-                exc,
+    for idx, option_variant in enumerate(send_option_variants):
+        try:
+            send_result = client.send_email_extended(
+                row_id=str(row_id),
+                to_email=recipient_email,
+                subject=reply_subject,
+                body=final_message,
+                idempotency_key=send_idempotency_key,
+                **option_variant,
             )
-            try:
-                send_result = client.send_email_extended(
-                    row_id=str(row_id),
-                    to_email=recipient_email,
-                    subject=reply_subject,
-                    body=final_message,
-                    idempotency_key=send_idempotency_key,
+            if idx > 0:
+                logger.warning(
+                    "Email send succeeded after reducing threading payload. row_id=%s variant_index=%s",
+                    row_id,
+                    idx,
                 )
-            except ICollectorClientError as retry_exc:
-                inbound.requires_human = True
-                inbound.human_notes = f"Email send failed: {retry_exc}"
-                inbound.save(update_fields=["requires_human", "human_notes", "updated_at"])
-                return {"status": "failed", "reason": "send_error", "error": str(retry_exc)}
-        else:
+            break
+        except ICollectorClientError as exc:
+            last_send_error = exc
+            has_more_variants = idx < len(send_option_variants) - 1
+            if has_more_variants and option_variant and _is_email_payload_validation_error(exc):
+                logger.warning(
+                    "Email send payload variant rejected; retrying reduced metadata. row_id=%s variant_index=%s error=%s",
+                    row_id,
+                    idx,
+                    exc,
+                )
+                continue
             inbound.requires_human = True
             inbound.human_notes = f"Email send failed: {exc}"
             inbound.save(update_fields=["requires_human", "human_notes", "updated_at"])
             return {"status": "failed", "reason": "send_error", "error": str(exc)}
+
+    if send_result is None:
+        error_text = str(last_send_error) if last_send_error else "Unknown email send error."
+        inbound.requires_human = True
+        inbound.human_notes = f"Email send failed: {error_text}"
+        inbound.save(update_fields=["requires_human", "human_notes", "updated_at"])
+        return {"status": "failed", "reason": "send_error", "error": error_text}
 
     outbound = MessagesOutbound.objects.create(
         crm_data=related.get("crm_data"),

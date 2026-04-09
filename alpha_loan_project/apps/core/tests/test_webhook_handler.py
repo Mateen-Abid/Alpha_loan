@@ -428,7 +428,7 @@ class ICollectorWebhookAutoReplyTests(TestCase):
         self.assertIn("<prior-1@icollector.ai>", threading.get("references", []))
         self.assertIn(inbound_message_id, threading.get("references", []))
 
-    def test_email_threading_validation_error_retries_with_basic_payload(self):
+    def test_email_threading_validation_error_retries_with_reduced_payload(self):
         self._create_crm_and_ingestion(row_id=72012, email="john@example.com")
         self._create_prior_outbound_email(
             row_id=72012,
@@ -457,6 +457,7 @@ class ICollectorWebhookAutoReplyTests(TestCase):
         ), patch(
             "apps.core.views.webhook_handler.ICollectorClient.send_email_extended",
             side_effect=[
+                ICollectorClientError("400 Client Error: Bad Request | detail=Unknown field: conversation_id"),
                 ICollectorClientError("400 Client Error: Bad Request | detail=Unknown field: thread_id"),
                 {"status": "success", "message_id": "email-thread-2"},
             ],
@@ -465,15 +466,19 @@ class ICollectorWebhookAutoReplyTests(TestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["result"]["auto_reply"]["status"], "sent")
-        self.assertEqual(mock_send.call_count, 2)
+        self.assertEqual(mock_send.call_count, 3)
         first_kwargs = mock_send.call_args_list[0].kwargs
         second_kwargs = mock_send.call_args_list[1].kwargs
+        third_kwargs = mock_send.call_args_list[2].kwargs
         self.assertIn("threading", first_kwargs)
         self.assertIn("mailbox_role", first_kwargs)
         self.assertIn("connection_id", first_kwargs)
-        self.assertNotIn("threading", second_kwargs)
-        self.assertNotIn("mailbox_role", second_kwargs)
-        self.assertNotIn("connection_id", second_kwargs)
+        self.assertIn("threading", second_kwargs)
+        self.assertIn("mailbox_role", second_kwargs)
+        self.assertIn("connection_id", second_kwargs)
+        self.assertIn("threading", third_kwargs)
+        self.assertNotIn("thread_id", third_kwargs["threading"])
+        self.assertIn("in_reply_to_message_id", third_kwargs["threading"])
 
     def test_non_daily_reject_email_row_stores_inbound_only(self):
         self._create_crm_and_ingestion(row_id=72002, board_id=71, group_id=91, email="john@example.com")
