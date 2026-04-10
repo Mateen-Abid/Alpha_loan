@@ -47,13 +47,6 @@ _AUTOMATION_MODES = {"all", "allowlist", "off"}
 _DEFAULT_PROPOSAL_WINDOW_HOURS = 24
 _DEFAULT_FOLLOWUP_INTERVAL_HOURS = 1
 _DEFAULT_MAX_WAVE_LEVEL = 5
-_WAVE_URGENCY_SUFFIX = {
-    1: "",
-    2: " This is a follow-up reminder.",
-    3: " This is urgent.",
-    4: " Immediate action is required.",
-    5: " Final automated notice before manual review.",
-}
 
 
 def _trim_text(value: str, max_chars: int = 180) -> str:
@@ -401,10 +394,6 @@ def _build_daily_reject_offer(
     }
     offer = offer_lines.get(level, offer_lines[14])
 
-    urgency_suffix = _WAVE_URGENCY_SUFFIX.get(
-        min(max(1, wave_level), _get_max_wave_level()),
-        _WAVE_URGENCY_SUFFIX[_DEFAULT_MAX_WAVE_LEVEL],
-    )
     if reason_code in _CLOSED_ACCOUNT_CODES:
         payment_instruction_suffix = " Please send your updated void cheque/PAD details so scheduled payments can resume."
     else:
@@ -421,7 +410,7 @@ def _build_daily_reject_offer(
 
     return (
         f"Your missed payment is ${amounts['missed']:.2f} and NSF fee is $50.00. "
-        f"{offer}{payment_instruction_suffix}{urgency_suffix}{strict_suffix}"
+        f"{offer}{payment_instruction_suffix}{strict_suffix}"
     ).strip()
 
 
