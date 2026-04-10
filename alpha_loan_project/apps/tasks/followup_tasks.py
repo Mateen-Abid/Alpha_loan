@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
-from datetime import timedelta
+from datetime import datetime, timedelta
 from decimal import Decimal
 import logging
 import re
-from typing import Dict
+from typing import Dict, Optional
 
 from celery import shared_task
 from django.conf import settings
@@ -43,6 +43,17 @@ _CONTRACT_BREACH_PHRASES = (
     "contract obligation",
     "contract breach",
 )
+_AUTOMATION_MODES = {"all", "allowlist", "off"}
+_DEFAULT_PROPOSAL_WINDOW_HOURS = 24
+_DEFAULT_FOLLOWUP_INTERVAL_HOURS = 1
+_DEFAULT_MAX_WAVE_LEVEL = 5
+_WAVE_TONE_PREFIX = {
+    1: "Friendly reminder",
+    2: "Follow-up reminder",
+    3: "Action needed",
+    4: "Urgent follow-up",
+    5: "Final automated notice",
+}
 
 
 def _trim_text(value: str, max_chars: int = 180) -> str:
@@ -50,6 +61,116 @@ def _trim_text(value: str, max_chars: int = 180) -> str:
     if len(text) <= max_chars:
         return text
     return text[: max_chars - 3].rstrip() + "..."
+
+
+def _safe_int(value: object, default: int = 0, min_value: Optional[int] = None, max_value: Optional[int] = None) -> int:
+    try:
+        parsed = int(str(value).strip())
+    except Exception:
+        parsed = default
+    if min_value is not None:
+        parsed = max(min_value, parsed)
+    if max_value is not None:
+        parsed = min(max_value, parsed)
+    return parsed
+
+
+def _parse_iso_datetime(raw: str) -> Optional[datetime]:
+    text = (raw or "").strip()
+    if not text:
+        return None
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        return timezone.make_aware(parsed) if timezone.is_naive(parsed) else parsed
+    except Exception:
+        return None
+
+
+def _get_followup_interval_hours() -> int:
+    return _safe_int(
+        getattr(settings, "COLLECTION_FOLLOWUP_INTERVAL_HOURS", _DEFAULT_FOLLOWUP_INTERVAL_HOURS),
+        default=_DEFAULT_FOLLOWUP_INTERVAL_HOURS,
+        min_value=1,
+    )
+
+
+def _get_proposal_window_hours() -> int:
+    return _safe_int(
+        getattr(settings, "COLLECTION_PROPOSAL_WINDOW_HOURS", _DEFAULT_PROPOSAL_WINDOW_HOURS),
+        default=_DEFAULT_PROPOSAL_WINDOW_HOURS,
+        min_value=1,
+    )
+
+
+def _get_max_wave_level() -> int:
+    return _safe_int(
+        getattr(settings, "COLLECTION_MAX_WAVE_LEVEL", _DEFAULT_MAX_WAVE_LEVEL),
+        default=_DEFAULT_MAX_WAVE_LEVEL,
+        min_value=1,
+    )
+
+
+def _parse_allowed_row_ids(raw: object) -> set[int]:
+    if raw is None:
+        return set()
+    if isinstance(raw, str):
+        candidates = [item.strip() for item in raw.split(",")]
+    elif isinstance(raw, (list, tuple, set)):
+        candidates = list(raw)
+    else:
+        candidates = [raw]
+
+    allowed: set[int] = set()
+    for item in candidates:
+        if item in (None, "", "null"):
+            continue
+        try:
+            allowed.add(int(str(item).strip()))
+        except Exception:
+            continue
+    return allowed
+
+
+def _automation_mode() -> str:
+    mode = str(getattr(settings, "AUTO_REPLY_MODE", "all") or "all").strip().lower()
+    return mode if mode in _AUTOMATION_MODES else "all"
+
+
+def _case_row_id_int(case: CollectionCase) -> Optional[int]:
+    raw = case.partner_row_id or case.account_id
+    if raw in (None, "", "null"):
+        return None
+    try:
+        return int(str(raw).strip())
+    except Exception:
+        return None
+
+
+def _is_case_allowed_for_automation(case: CollectionCase) -> bool:
+    mode = _automation_mode()
+    if mode == "off":
+        return False
+    if mode != "allowlist":
+        return True
+
+    allowed = _parse_allowed_row_ids(getattr(settings, "AUTO_REPLY_ALLOWED_ROW_IDS", ""))
+    if not allowed:
+        return False
+    row_id = _case_row_id_int(case)
+    return row_id is not None and row_id in allowed
+
+
+def _proposal_deadline(now: datetime) -> datetime:
+    return now + timedelta(hours=_get_proposal_window_hours())
+
+
+def _resolve_proposal_deadline(meta: Dict[str, str], now: datetime) -> datetime:
+    parsed = _parse_iso_datetime(meta.get("proposal_deadline_at", ""))
+    return parsed or _proposal_deadline(now)
+
+
+def _current_wave_level(meta: Dict[str, str]) -> int:
+    return _safe_int(meta.get("wave_level", "1"), default=1, min_value=1, max_value=_get_max_wave_level())
 
 
 def _build_conversation_memory(case: CollectionCase) -> str:
@@ -137,6 +258,7 @@ def _build_case_context(case: CollectionCase) -> Dict[str, object]:
     meta = _extract_meta(case)
     proposal_level = int(meta.get("proposal_level", "1")) if meta.get("proposal_level", "1").isdigit() else 1
     no_reply_count = int(meta.get("no_reply_count", "0")) if meta.get("no_reply_count", "0").isdigit() else 0
+    wave_level = _current_wave_level(meta)
     reason_code = meta.get("ingest_reason_code", "")
     nsf_count_text = (meta.get("raw_reason", "") + " " + (meta.get("raw_comment", ""))).lower()
     nsf_band = "1_2_nsf"
@@ -150,6 +272,7 @@ def _build_case_context(case: CollectionCase) -> Dict[str, object]:
         "borrower_name": case.borrower_name,
         "reason_code": reason_code,
         "proposal_level": proposal_level,
+        "wave_level": wave_level,
         "no_reply_count": no_reply_count,
         "nsf_band": nsf_band,
         "conversation_memory": _build_conversation_memory(case),
@@ -226,7 +349,13 @@ def _daily_reject_financials(case: CollectionCase) -> Dict[str, Decimal]:
     return {"missed": missed, "fee": fee, "immediate": immediate, "balance": balance}
 
 
-def _build_daily_reject_offer(case: CollectionCase, level: int, no_reply_count: int = 0) -> str:
+def _build_daily_reject_offer(
+    case: CollectionCase,
+    level: int,
+    *,
+    wave_level: int,
+    no_reply_count: int = 0,
+) -> str:
     first_name = (case.borrower_name or "there").split()[0]
     meta = _extract_meta(case)
     reason_code = meta.get("ingest_reason_code", "")
@@ -251,7 +380,7 @@ def _build_daily_reject_offer(case: CollectionCase, level: int, no_reply_count: 
     }
     offer = offer_lines.get(level, offer_lines[14])
 
-    tone = _FOLLOWUP_TONE_VARIANTS[min(no_reply_count, len(_FOLLOWUP_TONE_VARIANTS) - 1)]
+    tone = _WAVE_TONE_PREFIX.get(min(max(1, wave_level), _get_max_wave_level()), _WAVE_TONE_PREFIX[_DEFAULT_MAX_WAVE_LEVEL])
     stop_payment_suffix = ""
     if reason_code in _STOP_PAYMENT_CODES:
         stop_payment_suffix = " Also confirm your bank removed the stop-payment block."
@@ -276,10 +405,10 @@ def _classify_message_signal(message: str, ai_intent: str | None) -> str:
     text = (message or "").lower()
     if any(k in text for k in _LEGAL_KEYWORDS):
         return "legal_stop"
-    if ai_intent == "promise_to_pay" or any(k in text for k in _AGREEMENT_KEYWORDS):
-        return "agreement"
     if ai_intent == "refusal" or any(k in text for k in _REFUSAL_KEYWORDS):
         return "refusal"
+    if ai_intent == "promise_to_pay" or any(k in text for k in _AGREEMENT_KEYWORDS):
+        return "agreement"
     return "neutral"
 
 
@@ -297,9 +426,16 @@ def send_followup_messages(self):
 
     orchestrator = AIOrchestrator()
     router = CommunicationRouter()
+    followup_interval_hours = _get_followup_interval_hours()
+    max_wave_level = _get_max_wave_level()
 
     for case in cases:
         try:
+            if not _is_case_allowed_for_automation(case):
+                logger.info("Skipping follow-up for case %s (row-id gate).", case.account_id)
+                continue
+
+            loop_now = timezone.now()
             is_daily = _is_daily_reject_case(case)
             channel = _select_outbound_channel(case)
             interaction_channel = (
@@ -308,11 +444,30 @@ def send_followup_messages(self):
                 else InteractionLedger.CommunicationChannel.EMAIL
             )
             ai_generated = False
+            meta = _extract_meta(case)
+            level = _safe_int(meta.get("proposal_level", "1"), default=1, min_value=1, max_value=14)
+            wave_level = _current_wave_level(meta)
+            no_reply_seed = _safe_int(meta.get("no_reply_count", "0"), default=0, min_value=0)
+            proposal_deadline_at = _resolve_proposal_deadline(meta, loop_now)
+            proposal_escalated = False
+
             if is_daily:
-                meta = _extract_meta(case)
-                level = max(1, min(14, int(meta.get("proposal_level", "1"))))
-                no_reply_count = int(meta.get("no_reply_count", "0")) + 1
-                message = _apply_risk_policy(_build_daily_reject_offer(case, level=level, no_reply_count=no_reply_count))
+                if loop_now >= proposal_deadline_at:
+                    next_level = min(14, level + 1)
+                    if next_level != level:
+                        proposal_escalated = True
+                    level = next_level
+                    no_reply_seed = 0
+                    proposal_deadline_at = _proposal_deadline(loop_now)
+                no_reply_count = no_reply_seed + 1
+                message = _apply_risk_policy(
+                    _build_daily_reject_offer(
+                        case,
+                        level=level,
+                        wave_level=wave_level,
+                        no_reply_count=no_reply_count,
+                    )
+                )
             else:
                 ai_message = orchestrator.generate_outbound_message(channel, _build_case_context(case))
                 message = ai_message.get("message") or (
@@ -321,14 +476,13 @@ def send_followup_messages(self):
                 message = _apply_risk_policy(message)
                 ai_generated = bool(ai_message.get("status") == "success")
                 no_reply_count = 0
-                level = 1
 
             duplicate_exists = InteractionLedger.objects.filter(
                 collection_case=case,
                 interaction_type=InteractionLedger.InteractionType.OUTBOUND,
                 channel=interaction_channel,
                 message_content=message,
-                created_at__gte=timezone.now() - timedelta(minutes=10),
+                created_at__gte=loop_now - timedelta(minutes=10),
             ).exists()
             if duplicate_exists:
                 logger.info("Skipping duplicate follow-up dispatch for case %s", case.account_id)
@@ -342,22 +496,31 @@ def send_followup_messages(self):
             )
             router.send_message(channel=channel, payload=payload)
 
-            next_run = timezone.now() + timedelta(hours=1) if is_daily else timezone.now() + timedelta(days=3)
+            next_run = (
+                loop_now + timedelta(hours=followup_interval_hours)
+                if is_daily
+                else loop_now + timedelta(days=3)
+            )
             case.next_action_time = next_run
             case.next_followup_at = next_run
-            case.last_contact_at = timezone.now()
+            case.last_contact_at = loop_now
 
             if is_daily:
                 target_step = _proposal_level_to_step(level)
                 if case.current_workflow_step != target_step:
                     case.current_workflow_step = target_step
-                    case.workflow_step_started_at = timezone.now()
+                    case.workflow_step_started_at = loop_now
+                next_wave_level = min(max_wave_level, wave_level + 1)
+                if proposal_escalated:
+                    case.workflow_step_started_at = loop_now
                 _append_case_meta(
                     case,
                     {
                         "proposal_level": level,
+                        "wave_level": next_wave_level,
                         "no_reply_count": no_reply_count,
-                        "last_outreach_at": timezone.now().isoformat(),
+                        "proposal_deadline_at": proposal_deadline_at.isoformat(),
+                        "last_outreach_at": loop_now.isoformat(),
                     },
                 )
 
@@ -395,10 +558,16 @@ def process_borrower_message(self, case_id: int, interaction_id: int, message: s
         interaction.reply_message = ai_result.get("suggested_response", {}).get("message")
         interaction.save()
 
+        now = timezone.now()
+        followup_interval_hours = _get_followup_interval_hours()
+        max_wave_level = _get_max_wave_level()
+        automation_allowed = _is_case_allowed_for_automation(case)
         suggested_message = ""
         if _is_daily_reject_case(case):
             meta = _extract_meta(case)
-            level = max(1, min(14, int(meta.get("proposal_level", "1"))))
+            level = _safe_int(meta.get("proposal_level", "1"), default=1, min_value=1, max_value=14)
+            wave_level = _current_wave_level(meta)
+            proposal_deadline_at = _resolve_proposal_deadline(meta, now)
 
             if signal == "legal_stop":
                 case.automation_status = CollectionCase.AutomationStatus.STOPPED
@@ -407,11 +576,21 @@ def process_borrower_message(self, case_id: int, interaction_id: int, message: s
                 level = min(14, level + 1)
                 target_step = _proposal_level_to_step(level)
                 case.current_workflow_step = target_step
-                case.workflow_step_started_at = timezone.now()
-                suggested_message = _apply_risk_policy(_build_daily_reject_offer(case, level=level, no_reply_count=0))
-                _append_case_meta(case, {"proposal_level": level, "no_reply_count": 0})
+                case.workflow_step_started_at = now
+                proposal_deadline_at = _proposal_deadline(now)
+                suggested_message = _apply_risk_policy(
+                    _build_daily_reject_offer(case, level=level, wave_level=wave_level, no_reply_count=0)
+                )
+                _append_case_meta(
+                    case,
+                    {
+                        "proposal_level": level,
+                        "no_reply_count": 0,
+                        "proposal_deadline_at": proposal_deadline_at.isoformat(),
+                    },
+                )
             elif signal == "agreement":
-                promised_date = (timezone.now() + timedelta(days=1)).date()
+                promised_date = (now + timedelta(days=1)).date()
                 exists = PaymentCommitment.objects.filter(
                     collection_case=case,
                     committed_amount=case.get_remaining_balance(),
@@ -430,21 +609,40 @@ def process_borrower_message(self, case_id: int, interaction_id: int, message: s
                         commitment_source=channel.upper(),
                         notes="Created from borrower agreement in daily reject flow",
                     )
-                _append_case_meta(case, {"no_reply_count": 0})
+                case.automation_status = CollectionCase.AutomationStatus.PAUSED
+                _append_case_meta(
+                    case,
+                    {
+                        "no_reply_count": 0,
+                        "proposal_level": level,
+                        "proposal_deadline_at": proposal_deadline_at.isoformat(),
+                        "promise_status": "pending",
+                        "promise_date": promised_date.isoformat(),
+                    },
+                )
                 suggested_message = _apply_risk_policy(
                     "Thanks for confirming. Please send payment as agreed today so we can close this item."
                 )
             else:
-                _append_case_meta(case, {"no_reply_count": 0})
-                suggested_message = _apply_risk_policy(_build_daily_reject_offer(case, level=level, no_reply_count=0))
+                _append_case_meta(
+                    case,
+                    {
+                        "no_reply_count": 0,
+                        "proposal_level": level,
+                        "proposal_deadline_at": proposal_deadline_at.isoformat(),
+                    },
+                )
+                suggested_message = _apply_risk_policy(
+                    _build_daily_reject_offer(case, level=level, wave_level=wave_level, no_reply_count=0)
+                )
         else:
             if intent == "refusal":
                 state_machine = WorkflowStateMachine(WorkflowState[case.current_workflow_step])
                 if state_machine.transition(WorkflowActions.BORROWER_REFUSED):
                     case.current_workflow_step = state_machine.current_state.value
-                    case.workflow_step_started_at = timezone.now()
+                    case.workflow_step_started_at = now
             elif intent == "promise_to_pay":
-                promised_date = (timezone.now() + timedelta(days=3)).date()
+                promised_date = (now + timedelta(days=3)).date()
                 exists = PaymentCommitment.objects.filter(
                     collection_case=case,
                     committed_amount=case.get_remaining_balance(),
@@ -465,21 +663,45 @@ def process_borrower_message(self, case_id: int, interaction_id: int, message: s
                     )
             suggested_message = _apply_risk_policy(ai_result.get("suggested_response", {}).get("message", ""))
 
-        case.last_contact_at = timezone.now()
-        case.next_action_time = timezone.now() + timedelta(hours=1 if _is_daily_reject_case(case) else 2)
+        case.last_contact_at = now
+        if _is_daily_reject_case(case):
+            case.next_action_time = now + timedelta(hours=followup_interval_hours)
+        else:
+            case.next_action_time = now + timedelta(hours=2)
         case.next_followup_at = case.next_action_time
         case.save()
 
-        if suggested_message and case.automation_status == CollectionCase.AutomationStatus.ACTIVE:
-            router = CommunicationRouter()
-            payload = _build_dispatch_payload(
-                case,
-                suggested_message,
-                subject="Account Update",
-                ai_generated=not _is_daily_reject_case(case),
+        should_send_now = bool(
+            suggested_message
+            and (
+                case.automation_status == CollectionCase.AutomationStatus.ACTIVE
+                or signal == "agreement"
             )
-            outbound_channel = _select_outbound_channel(case)
-            router.send_message(outbound_channel, payload)
+        )
+        if should_send_now:
+            if automation_allowed:
+                router = CommunicationRouter()
+                payload = _build_dispatch_payload(
+                    case,
+                    suggested_message,
+                    subject="Account Update",
+                    ai_generated=not _is_daily_reject_case(case),
+                )
+                outbound_channel = _select_outbound_channel(case)
+                router.send_message(outbound_channel, payload)
+                if _is_daily_reject_case(case):
+                    meta_after_send = _extract_meta(case)
+                    current_wave = _current_wave_level(meta_after_send)
+                    _append_case_meta(
+                        case,
+                        {
+                            "wave_level": min(max_wave_level, current_wave + 1),
+                            "last_outreach_at": timezone.now().isoformat(),
+                        },
+                    )
+                    case.save(update_fields=["notes", "updated_at"])
+            else:
+                logger.info("Skipping auto-reply dispatch for case %s (row-id gate).", case.account_id)
 
         logger.info("Processed message for case %s, signal: %s", case.account_id, signal)
         return {"status": "success", "intent": signal if signal != "neutral" else intent}
