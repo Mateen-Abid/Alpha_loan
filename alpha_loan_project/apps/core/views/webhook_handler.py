@@ -42,6 +42,7 @@ _PHONE_DIGITS_RE = re.compile(r"\D")
 _PLACEHOLDER_PATTERN = re.compile(r"\[[^\]]+\]")
 _CALL_US_PATTERN = re.compile(r"\bcall\s+us\b[^.!?]*[.!?]?", re.IGNORECASE)
 _FORMAL_PHRASE_PATTERN = re.compile(r"\b(please remit|to resolve|current balance is)\b", re.IGNORECASE)
+_MESSAGE_ID_TOKEN_SPLIT_RE = re.compile(r"[\s,]+")
 
 
 def _verify_signature(request) -> bool:
@@ -291,18 +292,39 @@ def _normalize_references(raw: object) -> list[str]:
         return []
 
     if isinstance(raw, str):
-        candidates = [item for item in re.split(r"[\s,]+", raw.strip()) if item]
+        candidates = [item for item in _MESSAGE_ID_TOKEN_SPLIT_RE.split(raw.strip()) if item]
     elif isinstance(raw, (list, tuple, set)):
-        candidates = [_truncate_text(item, 255) for item in raw]
+        candidates = list(raw)
     else:
-        candidates = [_truncate_text(raw, 255)]
+        candidates = [raw]
 
     normalized: list[str] = []
     for item in candidates:
-        text = _truncate_text(item, 255)
+        text = _as_internet_message_id(item)
         if text and text not in normalized:
             normalized.append(text)
     return normalized
+
+
+def _as_internet_message_id(value: object) -> str:
+    text = _truncate_text(value, 255).strip()
+    if not text:
+        return ""
+    if text.startswith("<") and text.endswith(">"):
+        text = text[1:-1].strip()
+    if "@" not in text:
+        return ""
+    if text.lower().startswith("aqmk"):
+        return ""
+    return text
+
+
+def _pick_first_internet_message_id(*values: object) -> str:
+    for value in values:
+        text = _as_internet_message_id(value)
+        if text:
+            return text
+    return ""
 
 
 def _extract_email_reply_subject(payload: Dict[str, object], previous_outbound: Optional[MessagesOutbound]) -> str:
@@ -315,211 +337,103 @@ def _extract_email_reply_subject(payload: Dict[str, object], previous_outbound: 
         _dig(provider_response, "subject"),
         max_length=255,
     )
-    return subject or "Re: Account Update"
+    if not subject:
+        return "Re: Account Update"
+    return subject if subject.lower().startswith("re:") else f"Re: {subject}"
 
 
 def _extract_email_send_options(
     *,
     payload: Dict[str, object],
-    inbound: MessagesInbound,
     related: Dict[str, object],
 ) -> Dict[str, object]:
     data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
     previous_outbound = related.get("outbound_message")
     provider_response = getattr(previous_outbound, "provider_response", None) if previous_outbound else None
 
-    inbound_message_id = _first_non_empty_text(
-        data.get("message_id") if isinstance(data, dict) else "",
-        data.get("email_id") if isinstance(data, dict) else "",
-        data.get("internet_message_id") if isinstance(data, dict) else "",
-        data.get("provider_message_id") if isinstance(data, dict) else "",
-        data.get("external_id") if isinstance(data, dict) else "",
-        _dig(data, "headers", "message-id"),
-        _dig(data, "headers", "message_id"),
-        _dig(data, "headers", "Message-ID"),
-        inbound.provider_message_id,
-        max_length=255,
-    )
-    previous_message_id = _first_non_empty_text(
-        _dig(provider_response, "email_log", "message_id"),
-        _dig(provider_response, "email_log", "internet_message_id"),
-        _dig(provider_response, "message_id"),
-        getattr(previous_outbound, "provider_message_id", ""),
-        max_length=255,
-    )
     thread_id = _first_non_empty_text(
         data.get("thread_id") if isinstance(data, dict) else "",
-        data.get("thread") if isinstance(data, dict) else "",
-        data.get("threadId") if isinstance(data, dict) else "",
-        data.get("conversation_id") if isinstance(data, dict) else "",
-        data.get("conversationId") if isinstance(data, dict) else "",
-        data.get("email_thread_id") if isinstance(data, dict) else "",
         _dig(provider_response, "email_log", "thread_id"),
-        _dig(provider_response, "email_log", "conversation_id"),
         _dig(provider_response, "thread_id"),
+        max_length=255,
+    )
+    conversation_id = _first_non_empty_text(
+        data.get("conversation_id") if isinstance(data, dict) else "",
+        _dig(provider_response, "email_log", "conversation_id"),
         _dig(provider_response, "conversation_id"),
+        thread_id,
         max_length=255,
     )
     mailbox_role = _first_non_empty_text(
         data.get("mailbox_role") if isinstance(data, dict) else "",
-        data.get("mailbox") if isinstance(data, dict) else "",
         _dig(provider_response, "email_log", "mailbox_role"),
-        _dig(provider_response, "email_log", "mailbox"),
         _dig(provider_response, "mailbox_role"),
-        _dig(provider_response, "mailbox"),
         max_length=64,
     )
 
     raw_connection_id = _first_non_empty_text(
         data.get("connection_id") if isinstance(data, dict) else "",
-        data.get("mailbox_connection_id") if isinstance(data, dict) else "",
+        data.get("connection") if isinstance(data, dict) else "",
         _dig(provider_response, "email_log", "connection_id"),
-        _dig(provider_response, "email_log", "mailbox_connection_id"),
+        _dig(provider_response, "email_log", "connection"),
         _dig(provider_response, "connection_id"),
-        _dig(provider_response, "mailbox_connection_id"),
+        _dig(provider_response, "connection"),
         max_length=32,
     )
     connection_id = _to_int(raw_connection_id)
 
-    parent_message_id = inbound_message_id or _first_non_empty_text(
-        data.get("in_reply_to_message_id") if isinstance(data, dict) else "",
-        data.get("reply_to_message_id") if isinstance(data, dict) else "",
+    in_reply_to = _pick_first_internet_message_id(
+        data.get("header_message_id") if isinstance(data, dict) else "",
         data.get("in_reply_to") if isinstance(data, dict) else "",
-        data.get("inReplyTo") if isinstance(data, dict) else "",
-        data.get("reply_to") if isinstance(data, dict) else "",
-        data.get("parent_message_id") if isinstance(data, dict) else "",
         _dig(data, "headers", "in-reply-to"),
         _dig(data, "headers", "In-Reply-To"),
-        _dig(data, "headers", "in_reply_to"),
-        previous_message_id,
-        max_length=255,
+        _dig(data, "headers", "Message-ID"),
+        _dig(data, "headers", "message-id"),
+        _dig(provider_response, "email_log", "header_message_id"),
+        _dig(provider_response, "header_message_id"),
     )
 
-    references = []
+    references: list[str] = []
     if isinstance(data, dict):
         references.extend(_normalize_references(data.get("references")))
-        references.extend(_normalize_references(data.get("email_references")))
         references.extend(_normalize_references(_dig(data, "headers", "references")))
         references.extend(_normalize_references(_dig(data, "headers", "References")))
-    references.extend(_normalize_references(previous_message_id))
-    references.extend(_normalize_references(parent_message_id))
-
-    threading: Dict[str, object] = {}
-    if thread_id:
-        threading["thread_id"] = thread_id
-        threading["threadId"] = thread_id
-        threading["conversation_id"] = thread_id
-        threading["conversationId"] = thread_id
-    if parent_message_id:
-        # Send multiple common aliases used by provider implementations.
-        threading["in_reply_to_message_id"] = parent_message_id
-        threading["reply_to_message_id"] = parent_message_id
-        threading["in_reply_to"] = parent_message_id
-        threading["inReplyTo"] = parent_message_id
-        threading["parent_message_id"] = parent_message_id
-        threading["reply_to"] = parent_message_id
-    if references:
-        threading["references"] = references
-        threading["email_references"] = references
+    references.extend(_normalize_references(_dig(provider_response, "email_log", "references")))
+    references.extend(_normalize_references(_dig(provider_response, "references")))
+    references.extend(_normalize_references(_dig(provider_response, "email_log", "header_message_id")))
+    references.extend(_normalize_references(_dig(provider_response, "header_message_id")))
+    references.extend(_normalize_references(in_reply_to))
 
     options: Dict[str, object] = {}
     if mailbox_role:
         options["mailbox_role"] = mailbox_role
     if connection_id is not None:
         options["connection_id"] = connection_id
-    if threading:
-        options["threading"] = threading
+    if thread_id:
+        options["thread_id"] = thread_id
+    if conversation_id:
+        options["conversation_id"] = conversation_id
+    if in_reply_to:
+        options["in_reply_to"] = in_reply_to
+    if references:
+        options["references"] = references
     return options
 
 
-def _build_email_send_option_variants(send_options: Dict[str, object]) -> list[Dict[str, object]]:
-    """
-    Build ordered retry variants from most-specific thread metadata to basic payload.
-    This keeps best-effort threading even when provider rejects some optional keys.
-    """
-    variants: list[Dict[str, object]] = []
-    seen: set[str] = set()
-
-    mailbox_role = send_options.get("mailbox_role")
-    connection_id = send_options.get("connection_id")
-    threading_raw = send_options.get("threading")
-    threading = threading_raw if isinstance(threading_raw, dict) else {}
-
-    def _build_variant(threading_payload: Optional[Dict[str, object]]) -> Dict[str, object]:
-        variant: Dict[str, object] = {}
-        if mailbox_role:
-            variant["mailbox_role"] = mailbox_role
-        if connection_id is not None:
-            variant["connection_id"] = connection_id
-        if threading_payload:
-            variant["threading"] = threading_payload
-        return variant
-
-    def _append_variant(variant: Dict[str, object]) -> None:
-        key = json.dumps(variant, sort_keys=True, default=str)
-        if key not in seen:
-            seen.add(key)
-            variants.append(variant)
-
-    _append_variant(send_options or {})
-
-    if threading:
-        canonical_threading = {
-            key: threading[key]
-            for key in ("thread_id", "in_reply_to_message_id", "references")
-            if key in threading
-        }
-        if canonical_threading:
-            _append_variant(_build_variant(canonical_threading))
-
-        no_thread_id = {
-            key: threading[key]
-            for key in (
-                "in_reply_to_message_id",
-                "reply_to_message_id",
-                "in_reply_to",
-                "inReplyTo",
-                "parent_message_id",
-                "reply_to",
-                "references",
-            )
-            if key in threading
-        }
-        if no_thread_id:
-            _append_variant(_build_variant(no_thread_id))
-
-        thread_only = {
-            key: threading[key]
-            for key in ("thread_id", "threadId", "conversation_id", "conversationId")
-            if key in threading
-        }
-        if thread_only:
-            _append_variant(_build_variant(thread_only))
-
-    routing_only = _build_variant(None)
-    if routing_only:
-        _append_variant(routing_only)
-
-    _append_variant({})
-    return variants
-
-
-def _is_email_payload_validation_error(exc: Exception) -> bool:
-    message = str(exc).lower()
-    if "400" not in message:
-        return False
-    return any(
-        marker in message
-        for marker in (
-            "unknown field",
-            "unexpected field",
-            "extra fields",
-            "not allowed",
-            "invalid payload",
-            "validation",
-            "bad request",
-        )
-    )
+def _enforce_allowed_email_send_fields(send_options: Dict[str, object]) -> Dict[str, object]:
+    allowed_keys = {
+        "thread_id",
+        "conversation_id",
+        "in_reply_to",
+        "references",
+        "cc",
+        "bcc",
+        "to_addresses",
+        "connection_id",
+        "mailbox_role",
+        "idempotency_key",
+    }
+    return {key: value for key, value in send_options.items() if key in allowed_keys and value not in (None, "", [], {}, ())}
 
 
 def _extract_decimal_from_mixed(value: object) -> Optional[Decimal]:
@@ -1175,51 +1089,25 @@ def _maybe_auto_reply_to_inbound_email(
         return {"status": "skipped", "reason": "email_missing"}
 
     reply_subject = _extract_email_reply_subject(payload, previous_outbound)
-    send_options = _extract_email_send_options(payload=payload, inbound=inbound, related=related)
+    send_options = _enforce_allowed_email_send_fields(
+        _extract_email_send_options(payload=payload, related=related)
+    )
     send_idempotency_key = f"reply-email-send-{idempotency_prefix}-{inbound.id}"[:120]
-    send_option_variants = _build_email_send_option_variants(send_options)
-    send_result = None
-    last_send_error: Optional[ICollectorClientError] = None
 
-    for idx, option_variant in enumerate(send_option_variants):
-        try:
-            send_result = client.send_email_extended(
-                row_id=str(row_id),
-                to_email=recipient_email,
-                subject=reply_subject,
-                body=final_message,
-                idempotency_key=send_idempotency_key,
-                **option_variant,
-            )
-            if idx > 0:
-                logger.warning(
-                    "Email send succeeded after reducing threading payload. row_id=%s variant_index=%s",
-                    row_id,
-                    idx,
-                )
-            break
-        except ICollectorClientError as exc:
-            last_send_error = exc
-            has_more_variants = idx < len(send_option_variants) - 1
-            if has_more_variants and option_variant and _is_email_payload_validation_error(exc):
-                logger.warning(
-                    "Email send payload variant rejected; retrying reduced metadata. row_id=%s variant_index=%s error=%s",
-                    row_id,
-                    idx,
-                    exc,
-                )
-                continue
-            inbound.requires_human = True
-            inbound.human_notes = f"Email send failed: {exc}"
-            inbound.save(update_fields=["requires_human", "human_notes", "updated_at"])
-            return {"status": "failed", "reason": "send_error", "error": str(exc)}
-
-    if send_result is None:
-        error_text = str(last_send_error) if last_send_error else "Unknown email send error."
+    try:
+        send_result = client.send_email_extended(
+            row_id=int(row_id),
+            to_email=recipient_email,
+            subject=reply_subject,
+            body=final_message,
+            idempotency_key=send_idempotency_key,
+            **send_options,
+        )
+    except ICollectorClientError as exc:
         inbound.requires_human = True
-        inbound.human_notes = f"Email send failed: {error_text}"
+        inbound.human_notes = f"Email send failed: {exc}"
         inbound.save(update_fields=["requires_human", "human_notes", "updated_at"])
-        return {"status": "failed", "reason": "send_error", "error": error_text}
+        return {"status": "failed", "reason": "send_error", "error": str(exc)}
 
     outbound = MessagesOutbound.objects.create(
         crm_data=related.get("crm_data"),

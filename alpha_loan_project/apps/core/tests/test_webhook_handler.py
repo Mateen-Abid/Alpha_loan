@@ -378,26 +378,31 @@ class ICollectorWebhookAutoReplyTests(TestCase):
             provider_message_id="<prior-1@icollector.ai>",
             provider_response={
                 "email_log": {
-                    "message_id": "<prior-1@icollector.ai>",
+                    "message_id": "AQMkGraphPriorId",
+                    "header_message_id": "<prior-1@icollector.ai>",
                     "thread_id": "thread-abc",
+                    "conversation_id": "conversation-abc",
                     "mailbox_role": "collections",
-                    "connection_id": 17,
+                    "connection": 17,
                 }
             },
         )
 
-        inbound_message_id = "<inbound-2@client.example>"
+        inbound_graph_message_id = "AQMkInboundGraphId"
+        inbound_header_message_id = "<inbound-2@client.example>"
         payload = self._email_payload(
             event_id="evt-email-thread-1",
             row_id=72011,
             message="i can pay this evening",
-            subject="Re: Account Update",
+            subject="Account Update",
             extra_data={
-                "message_id": inbound_message_id,
+                "message_id": inbound_graph_message_id,
+                "header_message_id": inbound_header_message_id,
                 "thread_id": "thread-abc",
+                "conversation_id": "conversation-abc",
                 "mailbox_role": "collections",
                 "connection_id": 17,
-                "references": ["<prior-1@icollector.ai>"],
+                "references": ["<prior-1@icollector.ai>", "AQMkIgnoreThis"],
             },
         )
 
@@ -417,37 +422,47 @@ class ICollectorWebhookAutoReplyTests(TestCase):
         self.assertEqual(mock_send.call_count, 1)
         kwargs = mock_send.call_args.kwargs
         self.assertEqual(kwargs["subject"], "Re: Account Update")
+        self.assertIsInstance(kwargs["row_id"], int)
         self.assertEqual(kwargs["mailbox_role"], "collections")
         self.assertEqual(kwargs["connection_id"], 17)
-        self.assertIn("threading", kwargs)
-        threading = kwargs["threading"]
-        self.assertEqual(threading.get("thread_id"), "thread-abc")
-        self.assertEqual(threading.get("in_reply_to_message_id"), inbound_message_id)
-        self.assertEqual(threading.get("reply_to_message_id"), inbound_message_id)
-        self.assertEqual(threading.get("in_reply_to"), inbound_message_id)
-        self.assertIn("<prior-1@icollector.ai>", threading.get("references", []))
-        self.assertIn(inbound_message_id, threading.get("references", []))
+        self.assertEqual(kwargs.get("thread_id"), "thread-abc")
+        self.assertEqual(kwargs.get("conversation_id"), "conversation-abc")
+        self.assertEqual(kwargs.get("in_reply_to"), "inbound-2@client.example")
+        self.assertIn("prior-1@icollector.ai", kwargs.get("references", []))
+        self.assertIn("inbound-2@client.example", kwargs.get("references", []))
+        self.assertNotIn("AQMkIgnoreThis", kwargs.get("references", []))
+        self.assertNotIn("threading", kwargs)
+        self.assertNotIn("threadId", kwargs)
+        self.assertNotIn("in_reply_to_message_id", kwargs)
+        self.assertNotIn("conversationId", kwargs)
 
-    def test_email_threading_validation_error_retries_with_reduced_payload(self):
+    def test_email_autoreply_uses_allowed_payload_fields_only(self):
         self._create_crm_and_ingestion(row_id=72012, email="john@example.com")
         self._create_prior_outbound_email(
             row_id=72012,
             email="john@example.com",
             message="Please confirm when this will be handled.",
-            provider_message_id="<prior-2@icollector.ai>",
-            provider_response={"email_log": {"thread_id": "thread-fallback", "connection_id": 19}},
+            provider_message_id="AQMkPreviousGraphId",
+            provider_response={
+                "email_log": {
+                    "thread_id": "thread-fallback",
+                    "conversation_id": "conversation-fallback",
+                    "header_message_id": "<prior-2@icollector.ai>",
+                    "connection": 19,
+                }
+            },
         )
 
         payload = self._email_payload(
             event_id="evt-email-thread-2",
             row_id=72012,
             message="i will update soon",
-            subject="Re: Account Update",
+            subject="Account Update",
             extra_data={
-                "message_id": "<inbound-3@client.example>",
+                "message_id": "AQMkInboundGraph2",
+                "header_message_id": "<inbound-3@client.example>",
                 "thread_id": "thread-fallback",
-                "mailbox_role": "collections",
-                "connection_id": 19,
+                "conversation_id": "conversation-fallback",
             },
         )
 
@@ -456,29 +471,35 @@ class ICollectorWebhookAutoReplyTests(TestCase):
             return_value={"answer": "Please confirm exact timing today.", "model": "collections-gateway"},
         ), patch(
             "apps.core.views.webhook_handler.ICollectorClient.send_email_extended",
-            side_effect=[
-                ICollectorClientError("400 Client Error: Bad Request | detail=Unknown field: conversation_id"),
-                ICollectorClientError("400 Client Error: Bad Request | detail=Unknown field: thread_id"),
-                {"status": "success", "message_id": "email-thread-2"},
-            ],
+            return_value={"status": "success", "message_id": "email-thread-2"},
         ) as mock_send:
             response = self.api_client.post("/api/webhooks/icollector/", payload, format="json")
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["result"]["auto_reply"]["status"], "sent")
-        self.assertEqual(mock_send.call_count, 3)
-        first_kwargs = mock_send.call_args_list[0].kwargs
-        second_kwargs = mock_send.call_args_list[1].kwargs
-        third_kwargs = mock_send.call_args_list[2].kwargs
-        self.assertIn("threading", first_kwargs)
-        self.assertIn("mailbox_role", first_kwargs)
-        self.assertIn("connection_id", first_kwargs)
-        self.assertIn("threading", second_kwargs)
-        self.assertIn("mailbox_role", second_kwargs)
-        self.assertIn("connection_id", second_kwargs)
-        self.assertIn("threading", third_kwargs)
-        self.assertNotIn("thread_id", third_kwargs["threading"])
-        self.assertIn("in_reply_to_message_id", third_kwargs["threading"])
+        self.assertEqual(mock_send.call_count, 1)
+        kwargs = mock_send.call_args.kwargs
+        self.assertEqual(kwargs["thread_id"], "thread-fallback")
+        self.assertEqual(kwargs["conversation_id"], "conversation-fallback")
+        self.assertEqual(kwargs["in_reply_to"], "inbound-3@client.example")
+        self.assertIn("prior-2@icollector.ai", kwargs["references"])
+        self.assertIn("inbound-3@client.example", kwargs["references"])
+        self.assertEqual(kwargs["connection_id"], 19)
+        self.assertEqual(
+            set(kwargs.keys()),
+            {
+                "row_id",
+                "to_email",
+                "subject",
+                "body",
+                "thread_id",
+                "conversation_id",
+                "in_reply_to",
+                "references",
+                "connection_id",
+                "idempotency_key",
+            },
+        )
 
     def test_non_daily_reject_email_row_stores_inbound_only(self):
         self._create_crm_and_ingestion(row_id=72002, board_id=71, group_id=91, email="john@example.com")

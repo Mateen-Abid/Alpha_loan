@@ -203,15 +203,20 @@ class ICollectorClient:
 
     def send_email_extended(
         self,
-        row_id: str,
+        row_id: int | str,
         to_email: str,
         subject: str,
         body: str,
         mailbox_role: Optional[str] = None,
         connection_id: Optional[int] = None,
         cc: Optional[List[str]] = None,
+        bcc: Optional[List[str]] = None,
+        to_addresses: Optional[List[str]] = None,
+        thread_id: Optional[str] = None,
+        conversation_id: Optional[str] = None,
+        in_reply_to: Optional[str] = None,
+        references: Optional[List[str]] = None,
         idempotency_key: Optional[str] = None,
-        threading: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         payload: Dict[str, Any] = {
             "row_id": row_id,
@@ -225,13 +230,20 @@ class ICollectorClient:
             payload["connection_id"] = connection_id
         if cc:
             payload["cc"] = cc
+        if bcc:
+            payload["bcc"] = bcc
+        if to_addresses:
+            payload["to_addresses"] = to_addresses
+        if thread_id:
+            payload["thread_id"] = thread_id
+        if conversation_id:
+            payload["conversation_id"] = conversation_id
+        if in_reply_to:
+            payload["in_reply_to"] = in_reply_to
+        if references:
+            payload["references"] = references
         if idempotency_key:
             payload["idempotency_key"] = idempotency_key
-        if threading:
-            for key, value in threading.items():
-                if value in (None, "", [], {}, ()):
-                    continue
-                payload[key] = value
         return self.request("POST", "/api/partner-gateway/v1/email/send/", body=payload)
 
     def get_boards(self) -> Dict[str, Any]:
