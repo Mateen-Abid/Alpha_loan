@@ -147,13 +147,26 @@ Hard behavior rules:
 Return only SMS text, no JSON, no labels."""
 
 
+def _normalize_email_display_name(raw_name: object) -> str:
+    """
+    Normalize borrower display name for email greeting.
+    Falls back to 'Client' when value looks like placeholder/sentence noise.
+    """
+    text = " ".join(str(raw_name or "").replace("\n", " ").split())
+    if not text or text in {"{{client}}", "{{borrower_name}}"}:
+        return "Client"
+    if any(token in text for token in (".", "?", "!", "@")):
+        return "Client"
+    if len(text.split()) > 4:
+        return "Client"
+    return text
+
+
 def build_openai_email_prompt(context: Dict[str, object]) -> str:
-    """Build strict final-notice email body from context."""
-    client_name = str(
-        context.get("borrower_name")
-        or context.get("client")
-        or "{{client}}"
-    ).strip()
+    """Build professional final-notice email body from context."""
+    client_name = _normalize_email_display_name(
+        context.get("borrower_name") or context.get("client") or "{{client}}"
+    )
     tenant_name = str(
         context.get("tenant")
         or context.get("tenant_name")
@@ -162,13 +175,13 @@ def build_openai_email_prompt(context: Dict[str, object]) -> str:
     deadline = str(context.get("stop_payment_deadline") or "2pm EST today").strip()
 
     return (
-        f"{client_name},\n\n"
-        "You stopped your payment without notifying us. "
-        "This violates the contract you signed. "
-        f"Call us by {deadline} to confirm you've removed the stop payment.\n\n"
-        "This is your final notice.\n"
-        "Thank you.\n"
-        f"{tenant_name}"
+        f"Dear {client_name},\n\n"
+        "We are following up regarding the stop-payment instruction on your account that was made without prior notice. "
+        "This is a breach of your signed loan agreement.\n\n"
+        f"Please call us by {deadline} to confirm the stop payment has been removed and confirm your payment plan.\n\n"
+        "This is a final notice and requires immediate attention to avoid further escalation.\n\n"
+        "Regards,\n"
+        f"{tenant_name} Collections Team"
     )
 
 

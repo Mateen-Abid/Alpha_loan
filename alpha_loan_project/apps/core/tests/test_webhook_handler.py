@@ -11,11 +11,20 @@ from apps.core.integrations import ICollectorClientError
 from apps.core.views import webhook_handler
 
 
-@override_settings(ICOLLECTOR_OUTBOUND_SECRET="")
+@override_settings(ICOLLECTOR_OUTBOUND_SECRET="", AUTO_REPLY_MODE="all")
 class ICollectorWebhookAutoReplyTests(TestCase):
     def setUp(self):
         self.api_client = APIClient()
         webhook_handler._processed_events.clear()
+        orch = patch(
+            "apps.tasks.followup_tasks.AIOrchestrator.process_borrower_message",
+            return_value={
+                "intent": {"intent": "unknown", "confidence": 0.5},
+                "suggested_response": {"message": ""},
+            },
+        )
+        orch.start()
+        self.addCleanup(orch.stop)
 
     def _create_crm_and_ingestion(
         self,
@@ -138,40 +147,28 @@ class ICollectorWebhookAutoReplyTests(TestCase):
 
     def test_daily_reject_inbound_triggers_autoreply_with_message_pair_context(self):
         _, ingestion = self._create_crm_and_ingestion(row_id=70001)
-        prior = self._create_prior_outbound(
+        self._create_prior_outbound(
             row_id=70001,
             phone="+15145551234",
             message="hey John, this is mike from ilowns. your payment bounced. can you send it today?",
         )
 
         with patch(
-            "apps.core.views.webhook_handler.ICollectorClient.generate_collection_llm",
-            return_value={
-                "answer": "hey John, thanks for the update. total due is $150.00. what exact time are you sending this today?",
-                "model": "collections-gateway",
-            },
-        ) as mock_generate, patch(
             "apps.core.views.webhook_handler.ICollectorClient.send_sms_extended",
             return_value={"status": "success", "sms_log": {"message_id": "sms-1"}},
         ) as mock_send:
             response = self.api_client.post("/api/webhooks/icollector/", self._payload(
                 event_id="evt-pair-1",
                 row_id=70001,
-                message="i can pay later today",
+                message="what exactly do i owe right now?",
             ), format="json")
 
         self.assertEqual(response.status_code, 200)
         body = response.json()
         self.assertEqual(body["status"], "success")
         self.assertEqual(body["result"]["auto_reply"]["status"], "sent")
-        self.assertEqual(mock_generate.call_count, 1)
+        self.assertEqual(body["result"]["auto_reply"].get("flow"), "daily_reject_case")
         self.assertEqual(mock_send.call_count, 1)
-
-        prompt = mock_generate.call_args.kwargs["prompt"]
-        self.assertIn(prior.message_content, prompt)
-        self.assertIn("i can pay later today", prompt)
-        self.assertIn("Amount due target (amount + fee when available): $150.00", prompt)
-        self.assertIn("Fee amount: $50.00", prompt)
 
         inbound = MessagesInbound.objects.get(row_id=70001)
         self.assertTrue(inbound.is_processed)
@@ -180,7 +177,8 @@ class ICollectorWebhookAutoReplyTests(TestCase):
         latest_outbound = MessagesOutbound.objects.filter(row_id=70001).order_by("-id").first()
         self.assertIsNotNone(latest_outbound)
         self.assertEqual(latest_outbound.status, MessagesOutbound.Status.SENT)
-        self.assertIn("total due is $150.00", latest_outbound.message_content)
+        self.assertIn("Mike from iLoans", latest_outbound.message_content)
+        self.assertIn("Interac now", latest_outbound.message_content)
 
         ingestion.refresh_from_db()
         self.assertTrue(ingestion.message_generated)
@@ -215,11 +213,8 @@ class ICollectorWebhookAutoReplyTests(TestCase):
             message="hey John, this is mike from ilowns. we still need this handled.",
         )
 
-        payload = self._payload(event_id="evt-replay-1", row_id=70002, message="i can pay tomorrow")
+        payload = self._payload(event_id="evt-replay-1", row_id=70002, message="what is the deadline?")
         with patch(
-            "apps.core.views.webhook_handler.ICollectorClient.generate_collection_llm",
-            return_value={"answer": "hey John, thanks. total due is $150.00. what time tomorrow?"},
-        ), patch(
             "apps.core.views.webhook_handler.ICollectorClient.send_sms_extended",
             return_value={"status": "success", "sms_log": {"message_id": "sms-2"}},
         ) as mock_send:
@@ -237,12 +232,6 @@ class ICollectorWebhookAutoReplyTests(TestCase):
         self._create_crm_and_ingestion(row_id=70003)
 
         with patch(
-            "apps.core.views.webhook_handler.ICollectorClient.generate_collection_llm",
-            return_value={
-                "answer": "Please remit payment to resolve your current balance.",
-                "model": "collections-gateway",
-            },
-        ) as mock_generate, patch(
             "apps.core.views.webhook_handler.ICollectorClient.send_sms_extended",
             return_value={"status": "success", "sms_log": {"message_id": "sms-3"}},
         ) as mock_send:
@@ -254,12 +243,10 @@ class ICollectorWebhookAutoReplyTests(TestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(mock_send.call_count, 1)
-        prompt = mock_generate.call_args.kwargs["prompt"]
-        self.assertIn("No previous outbound message found.", prompt)
 
         outbound = MessagesOutbound.objects.filter(row_id=70003).order_by("-id").first()
         self.assertIsNotNone(outbound)
-        self.assertTrue(outbound.message_content.startswith("hey"))
+        self.assertIn("Mike from iLoans", outbound.message_content)
 
     def test_two_close_inbound_messages_use_correct_latest_pairing(self):
         self._create_crm_and_ingestion(row_id=70004)
@@ -273,30 +260,18 @@ class ICollectorWebhookAutoReplyTests(TestCase):
         event_two_at = timezone.now() + timedelta(seconds=20)
 
         with patch(
-            "apps.core.views.webhook_handler.ICollectorClient.generate_collection_llm",
-            side_effect=[
-                {
-                    "answer": "hey John, got it. total due is $150.00. can you send this by 5pm today?",
-                    "model": "collections-gateway",
-                },
-                {
-                    "answer": "hey John, thanks. still open at $150.00. can you confirm payment by 7pm?",
-                    "model": "collections-gateway",
-                },
-            ],
-        ) as mock_generate, patch(
             "apps.core.views.webhook_handler.ICollectorClient.send_sms_extended",
             side_effect=[
                 {"status": "success", "sms_log": {"message_id": "sms-4"}},
                 {"status": "success", "sms_log": {"message_id": "sms-5"}},
             ],
-        ):
+        ) as mock_send:
             self.api_client.post(
                 "/api/webhooks/icollector/",
                 self._payload(
                     event_id="evt-chain-1",
                     row_id=70004,
-                    message="i can send this afternoon",
+                    message="when is this payment due?",
                     occurred_at=event_one_at,
                 ),
                 format="json",
@@ -306,38 +281,37 @@ class ICollectorWebhookAutoReplyTests(TestCase):
                 self._payload(
                     event_id="evt-chain-2",
                     row_id=70004,
-                    message="actually i can do evening",
+                    message="i need until friday to sort this out",
                     occurred_at=event_two_at,
                 ),
                 format="json",
             )
 
-        self.assertEqual(mock_generate.call_count, 2)
-        second_prompt = mock_generate.call_args_list[1].kwargs["prompt"]
-        self.assertIn("hey John, got it. total due is $150.00. can you send this by 5pm today?", second_prompt)
-        self.assertIn("actually i can do evening", second_prompt)
+        self.assertEqual(mock_send.call_count, 2)
+        outbounds = list(MessagesOutbound.objects.filter(row_id=70004).order_by("id"))
+        self.assertGreaterEqual(len(outbounds), 3)
+        last_two = outbounds[-2:]
+        self.assertTrue(all("Mike from iLoans" in o.message_content for o in last_two))
 
     def test_daily_reject_email_inbound_triggers_autoreply_with_message_pair_context(self):
         _, ingestion = self._create_crm_and_ingestion(row_id=72001, email="john@example.com")
-        prior = self._create_prior_outbound_email(
+        self._create_prior_outbound_email(
             row_id=72001,
             email="john@example.com",
             message="John, this is Mike from ilowns. Please confirm your stop-payment status by 2pm EST today.",
         )
 
         with patch(
-            "apps.core.views.webhook_handler.ICollectorClient.generate_collection_llm",
-            return_value={
-                "answer": "John,\n\nThanks for the update. Please confirm the exact time today that you will remove the stop payment.\n\nThank you.",
-                "model": "collections-gateway",
-            },
-        ) as mock_generate, patch(
             "apps.core.views.webhook_handler.ICollectorClient.send_email_extended",
             return_value={"status": "success", "message_id": "email-1"},
         ) as mock_send:
             response = self.api_client.post(
                 "/api/webhooks/icollector/",
-                self._email_payload(event_id="evt-email-pair-1", row_id=72001, message="I can call by noon"),
+                self._email_payload(
+                    event_id="evt-email-pair-1",
+                    row_id=72001,
+                    message="what amount should i send today?",
+                ),
                 format="json",
             )
 
@@ -345,14 +319,7 @@ class ICollectorWebhookAutoReplyTests(TestCase):
         body = response.json()
         self.assertEqual(body["status"], "success")
         self.assertEqual(body["result"]["auto_reply"]["status"], "sent")
-        self.assertEqual(mock_generate.call_count, 1)
         self.assertEqual(mock_send.call_count, 1)
-
-        prompt = mock_generate.call_args.kwargs["prompt"]
-        self.assertIn(prior.message_content, prompt)
-        self.assertIn("I can call by noon", prompt)
-        self.assertIn("Amount due target (amount + fee when available): $150.00", prompt)
-        self.assertIn("Fee amount: $50.00", prompt)
 
         inbound = MessagesInbound.objects.get(row_id=72001, channel=MessagesInbound.Channel.EMAIL)
         self.assertTrue(inbound.is_processed)
@@ -363,6 +330,8 @@ class ICollectorWebhookAutoReplyTests(TestCase):
         self.assertEqual(latest_outbound.channel, MessagesOutbound.Channel.EMAIL)
         self.assertEqual(latest_outbound.status, MessagesOutbound.Status.SENT)
         self.assertEqual(latest_outbound.email, "john@example.com")
+        self.assertIn("Mike from iLoans", latest_outbound.message_content)
+        self.assertFalse(latest_outbound.message_content.startswith("Dear "))
 
         ingestion.refresh_from_db()
         self.assertTrue(ingestion.message_generated)
@@ -393,7 +362,7 @@ class ICollectorWebhookAutoReplyTests(TestCase):
         payload = self._email_payload(
             event_id="evt-email-thread-1",
             row_id=72011,
-            message="i can pay this evening",
+            message="please confirm how much i should send this evening",
             subject="Account Update",
             extra_data={
                 "message_id": inbound_graph_message_id,
@@ -407,12 +376,6 @@ class ICollectorWebhookAutoReplyTests(TestCase):
         )
 
         with patch(
-            "apps.core.views.webhook_handler.ICollectorClient.generate_collection_llm",
-            return_value={
-                "answer": "John,\n\nPlease confirm the exact payment time this evening.\n\nThank you.",
-                "model": "collections-gateway",
-            },
-        ), patch(
             "apps.core.views.webhook_handler.ICollectorClient.send_email_extended",
             return_value={"status": "success", "message_id": "email-thread-1"},
         ) as mock_send:
@@ -435,6 +398,8 @@ class ICollectorWebhookAutoReplyTests(TestCase):
         self.assertNotIn("threadId", kwargs)
         self.assertNotIn("in_reply_to_message_id", kwargs)
         self.assertNotIn("conversationId", kwargs)
+        self.assertIn("Mike from iLoans", kwargs["body"])
+        self.assertFalse(kwargs["body"].startswith("Dear "))
 
     def test_email_autoreply_uses_allowed_payload_fields_only(self):
         self._create_crm_and_ingestion(row_id=72012, email="john@example.com")
@@ -467,9 +432,6 @@ class ICollectorWebhookAutoReplyTests(TestCase):
         )
 
         with patch(
-            "apps.core.views.webhook_handler.ICollectorClient.generate_collection_llm",
-            return_value={"answer": "Please confirm exact timing today.", "model": "collections-gateway"},
-        ), patch(
             "apps.core.views.webhook_handler.ICollectorClient.send_email_extended",
             return_value={"status": "success", "message_id": "email-thread-2"},
         ) as mock_send:
@@ -485,21 +447,44 @@ class ICollectorWebhookAutoReplyTests(TestCase):
         self.assertIn("prior-2@icollector.ai", kwargs["references"])
         self.assertIn("inbound-3@client.example", kwargs["references"])
         self.assertEqual(kwargs["connection_id"], 19)
-        self.assertEqual(
-            set(kwargs.keys()),
-            {
-                "row_id",
-                "to_email",
-                "subject",
-                "body",
-                "thread_id",
-                "conversation_id",
-                "in_reply_to",
-                "references",
-                "connection_id",
-                "idempotency_key",
-            },
-        )
+        allowed = {
+            "row_id",
+            "to_email",
+            "subject",
+            "body",
+            "thread_id",
+            "conversation_id",
+            "in_reply_to",
+            "references",
+            "connection_id",
+            "idempotency_key",
+        }
+        self.assertTrue(set(kwargs.keys()).issubset(allowed))
+        self.assertEqual(set(kwargs.keys()), allowed)
+        self.assertFalse(kwargs["body"].startswith("Dear "))
+
+    def test_daily_reject_email_first_message_includes_greeting(self):
+        self._create_crm_and_ingestion(row_id=72021, email="john@example.com")
+
+        with patch(
+            "apps.core.views.webhook_handler.ICollectorClient.send_email_extended",
+            return_value={"status": "success", "message_id": "email-first-1"},
+        ) as mock_send:
+            response = self.api_client.post(
+                "/api/webhooks/icollector/",
+                self._email_payload(
+                    event_id="evt-email-first-1",
+                    row_id=72021,
+                    message="what is the current amount i should send?",
+                ),
+                format="json",
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["result"]["auto_reply"]["status"], "sent")
+        self.assertEqual(mock_send.call_count, 1)
+        body = mock_send.call_args.kwargs["body"]
+        self.assertTrue(body.startswith("Dear "))
 
     def test_non_daily_reject_email_row_stores_inbound_only(self):
         self._create_crm_and_ingestion(row_id=72002, board_id=71, group_id=91, email="john@example.com")
@@ -529,11 +514,12 @@ class ICollectorWebhookAutoReplyTests(TestCase):
             message="John, this is Mike from ilowns. Please confirm when you can resolve this.",
         )
 
-        payload = self._email_payload(event_id="evt-email-replay-1", row_id=72003, message="I can do this tomorrow")
+        payload = self._email_payload(
+            event_id="evt-email-replay-1",
+            row_id=72003,
+            message="what is the balance i need to clear?",
+        )
         with patch(
-            "apps.core.views.webhook_handler.ICollectorClient.generate_collection_llm",
-            return_value={"answer": "Please confirm exact time tomorrow.", "model": "collections-gateway"},
-        ), patch(
             "apps.core.views.webhook_handler.ICollectorClient.send_email_extended",
             return_value={"status": "success", "message_id": "email-2"},
         ) as mock_send:
@@ -559,9 +545,9 @@ class ICollectorWebhookAutoReplyTests(TestCase):
         )
 
         with patch(
-            "apps.core.views.webhook_handler.ICollectorClient.generate_collection_llm",
+            "apps.tasks.followup_tasks.AIOrchestrator.process_borrower_message",
             side_effect=ICollectorClientError("llm unavailable"),
-        ) as mock_generate, patch(
+        ) as mock_orch, patch(
             "apps.core.views.webhook_handler.ICollectorClient.send_email_extended"
         ) as mock_send:
             response = self.api_client.post(
@@ -573,13 +559,13 @@ class ICollectorWebhookAutoReplyTests(TestCase):
         self.assertEqual(response.status_code, 200)
         body = response.json()
         self.assertEqual(body["result"]["auto_reply"]["status"], "failed")
-        self.assertEqual(body["result"]["auto_reply"]["reason"], "llm_error")
-        self.assertEqual(mock_generate.call_count, 1)
+        self.assertEqual(body["result"]["auto_reply"]["reason"], "case_pipeline_error")
+        self.assertEqual(mock_orch.call_count, 1)
         self.assertEqual(mock_send.call_count, 0)
 
         inbound = MessagesInbound.objects.get(row_id=72004, channel=MessagesInbound.Channel.EMAIL)
         self.assertTrue(inbound.requires_human)
-        self.assertIn("Email LLM generation failed", inbound.human_notes)
+        self.assertIn("Case pipeline error", inbound.human_notes)
         self.assertFalse(inbound.is_processed)
 
     def test_email_send_failure_flags_human_review(self):
@@ -591,9 +577,6 @@ class ICollectorWebhookAutoReplyTests(TestCase):
         )
 
         with patch(
-            "apps.core.views.webhook_handler.ICollectorClient.generate_collection_llm",
-            return_value={"answer": "Please confirm exact time today.", "model": "collections-gateway"},
-        ) as mock_generate, patch(
             "apps.core.views.webhook_handler.ICollectorClient.send_email_extended",
             side_effect=ICollectorClientError("email send failed"),
         ) as mock_send:
@@ -607,7 +590,6 @@ class ICollectorWebhookAutoReplyTests(TestCase):
         body = response.json()
         self.assertEqual(body["result"]["auto_reply"]["status"], "failed")
         self.assertEqual(body["result"]["auto_reply"]["reason"], "send_error")
-        self.assertEqual(mock_generate.call_count, 1)
         self.assertEqual(mock_send.call_count, 1)
 
         inbound = MessagesInbound.objects.get(row_id=72005, channel=MessagesInbound.Channel.EMAIL)

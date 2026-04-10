@@ -7,7 +7,7 @@ import hmac
 import json
 import logging
 import re
-from datetime import datetime
+from datetime import datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from typing import Dict, Optional
 from urllib.parse import urlencode
@@ -24,11 +24,15 @@ from apps.core.integrations import ICollectorClient, ICollectorClientError
 from apps.ai.constants import build_openai_email_prompt
 
 from apps.collections.models import (
-    MessagesInbound,
-    MessagesOutbound,
+    CollectionCase,
     CRMData,
     IngestionData,
+    InteractionLedger,
+    MessagesInbound,
+    MessagesOutbound,
 )
+from apps.collections.services.collection_service import CollectionService
+from apps.tasks.followup_tasks import apply_daily_reject_wave_after_send, run_process_borrower_message
 
 logger = logging.getLogger(__name__)
 
@@ -530,6 +534,337 @@ def _is_daily_reject_related(related: Dict[str, object]) -> bool:
         return False
 
 
+def ensure_collection_case_for_daily_reject_webhook(
+    row_id: int,
+    related: Dict[str, object],
+) -> Optional[CollectionCase]:
+    """
+    Resolve or create a CollectionCase for Daily Reject webhooks so proposal ladder state can live in case.notes.
+    """
+    if not _is_daily_reject_related(related):
+        return None
+    rid = str(int(row_id))
+    case = CollectionCase.objects.filter(partner_row_id=rid).first()
+    if not case:
+        case = CollectionCase.objects.filter(account_id=f"row-{rid}").first()
+        if case and not case.partner_row_id:
+            case.partner_row_id = rid
+            case.save(update_fields=["partner_row_id", "updated_at"])
+    if case:
+        return case
+
+    crm = related.get("crm_data")
+    ing = related.get("ingestion_data")
+    if not crm:
+        return None
+
+    phone = _normalize_phone(
+        (getattr(ing, "phone", None) if ing else None)
+        or getattr(crm, "phone_number_formatted", None)
+        or getattr(crm, "phone_number_raw", None)
+        or ""
+    )
+    email = (getattr(ing, "email", None) if ing else None) or getattr(crm, "email", None) or ""
+    name = (
+        (getattr(ing, "borrower", None) if ing else None)
+        or getattr(crm, "client", None)
+        or f"Borrower {rid}"
+    )
+
+    due = Decimal("0.00")
+    if ing is not None and ing.amount is not None:
+        due = ing.amount
+    elif crm.amount is not None:
+        due = crm.amount
+
+    total_due = due + Decimal("50.00")
+    if ing is not None and ing.amount_plus_fee is not None:
+        total_due = ing.amount_plus_fee
+
+    balance = due
+    if ing is not None and ing.balance is not None:
+        balance = ing.balance
+    elif crm.balance is not None:
+        balance = crm.balance
+
+    reason = (getattr(ing, "reason_code", None) or "") or "UNKNOWN"
+    raw_reason = _truncate_text(getattr(crm, "reason", None) or "", 200)
+    window_h = int(getattr(settings, "COLLECTION_PROPOSAL_WINDOW_HOURS", 24) or 24)
+    deadline = timezone.now() + timedelta(hours=max(1, window_h))
+
+    notes = (
+        f"ingest_reason_code={reason}; raw_reason={raw_reason}; board_id=70; group_id=91; "
+        f"last_missed_due={due:.2f}; fee=50.00; immediate_due_with_fee={total_due:.2f}; "
+        f"balance_amount={balance:.2f}; balance_plus_fee={(balance + Decimal('50.00')):.2f}; "
+        f"proposal_level=1; no_reply_count=0; wave_level=1; proposal_deadline_at={deadline.isoformat()}; "
+        f"webhook_case_bootstrap=1"
+    )
+
+    account_id = f"row-{rid}"
+    if CollectionCase.objects.filter(account_id=account_id).exists():
+        account_id = f"row-{rid}-webhook"
+
+    return CollectionCase.objects.create(
+        account_id=account_id,
+        partner_row_id=rid,
+        borrower_name=str(name)[:255],
+        borrower_email=email or None,
+        borrower_phone=(phone[:20] if phone else "0000000000"),
+        principal_amount=due,
+        total_due=total_due,
+        delinquent_date=timezone.now().date(),
+        notes=notes,
+        current_workflow_step=CollectionCase.WorkflowStep.STEP_1,
+        status=CollectionCase.CollectionStatus.ACTIVE,
+        automation_status=CollectionCase.AutomationStatus.ACTIVE,
+        next_action_time=timezone.now(),
+    )
+
+
+def _mark_inbound_auto_reply_complete(
+    inbound: MessagesInbound,
+    *,
+    outbound: Optional[MessagesOutbound] = None,
+) -> None:
+    inbound.outbound_message = outbound
+    inbound.is_processed = True
+    inbound.processed_at = timezone.now()
+    inbound.requires_human = False
+    inbound.human_notes = ""
+    inbound.save(
+        update_fields=[
+            "outbound_message",
+            "is_processed",
+            "processed_at",
+            "requires_human",
+            "human_notes",
+            "updated_at",
+        ]
+    )
+
+
+def _daily_reject_auto_reply_via_collection_case(
+    inbound: MessagesInbound,
+    payload: Dict[str, object],
+    related: Dict[str, object],
+    *,
+    partner_channel: str,
+) -> Optional[Dict[str, object]]:
+    """
+    Run deterministic Daily Reject proposal flow (same as Celery) and send via partner APIs.
+    Returns a result dict, or None to fall back to LLM-only auto-reply.
+    """
+    if not _is_daily_reject_related(related):
+        return None
+
+    row_id = related.get("row_id")
+    if row_id is None:
+        return None
+    try:
+        rid = int(row_id)
+    except (TypeError, ValueError):
+        return None
+
+    case = ensure_collection_case_for_daily_reject_webhook(rid, related)
+    if not case:
+        return None
+
+    ext_id = _truncate_text(inbound.provider_message_id, 255) or None
+    ledger_channel = (
+        InteractionLedger.CommunicationChannel.EMAIL
+        if partner_channel == "email"
+        else InteractionLedger.CommunicationChannel.SMS
+    )
+
+    interaction: Optional[InteractionLedger] = None
+    if ext_id:
+        interaction = InteractionLedger.objects.filter(
+            collection_case=case,
+            external_id=ext_id,
+            interaction_type=InteractionLedger.InteractionType.INBOUND,
+        ).first()
+        if interaction and interaction.ai_processed_at:
+            return {
+                "status": "skipped",
+                "reason": "ledger_idempotent",
+                "note": "Inbound interaction already processed for this provider message id.",
+            }
+    if interaction is None:
+        interaction = CollectionService.record_interaction(
+            case=case,
+            channel=ledger_channel,
+            interaction_type=InteractionLedger.InteractionType.INBOUND,
+            message_content=inbound.message_content,
+            external_id=ext_id,
+            subject="",
+            status=InteractionLedger.InteractionStatus.PENDING,
+        )
+
+    try:
+        proc = run_process_borrower_message(
+            case.id,
+            interaction.id,
+            inbound.message_content,
+            partner_channel,
+            send_outbound=False,
+            outbound_channel_override=partner_channel,
+        )
+    except Exception as exc:
+        logger.exception("Daily reject collection case pipeline failed: %s", exc)
+        inbound.requires_human = True
+        inbound.human_notes = _truncate_text(f"Case pipeline error: {exc}", 500)
+        inbound.save(update_fields=["requires_human", "human_notes", "updated_at"])
+        return {"status": "failed", "reason": "case_pipeline_error", "error": str(exc)}
+
+    if proc.get("idempotent"):
+        return {
+            "status": "skipped",
+            "reason": "ledger_idempotent",
+            "note": "Interaction already processed.",
+        }
+
+    mo = proc.get("manual_outbound") or {}
+    final_message = (mo.get("message") or "").strip()
+    should_send = bool(mo.get("should_send"))
+    automation_allowed = bool(mo.get("automation_allowed"))
+    needs_wave = bool(mo.get("needs_daily_reject_wave_bump"))
+
+    context = _extract_reply_context(related)
+    row_id_int = int(rid)
+
+    if should_send and final_message and automation_allowed:
+        client = ICollectorClient()
+        idempotency_prefix = str(payload.get("event_id") or f"inbound-{partner_channel}-{inbound.id}")[:64]
+
+        if partner_channel == "email":
+            recipient_email = (
+                related.get("normalized_email")
+                or _normalize_email(inbound.from_email)
+                or _normalize_email(getattr(related.get("outbound_message"), "email", "") or "")
+            )
+            if not recipient_email:
+                inbound.requires_human = True
+                inbound.human_notes = "No recipient email for deterministic auto-reply."
+                inbound.save(update_fields=["requires_human", "human_notes", "updated_at"])
+                return {"status": "skipped", "reason": "email_missing"}
+
+            email_body = _format_professional_email_body(
+                final_message,
+                context,
+                include_greeting=not bool(related.get("outbound_message")),
+            )
+            reply_subject = _extract_email_reply_subject(payload, related.get("outbound_message"))
+            send_options = _enforce_allowed_email_send_fields(
+                _extract_email_send_options(payload=payload, related=related)
+            )
+            send_idempotency_key = f"reply-email-caseflow-{idempotency_prefix}-{inbound.id}"[:120]
+            try:
+                send_result = client.send_email_extended(
+                    row_id=row_id_int,
+                    to_email=recipient_email,
+                    subject=reply_subject,
+                    body=email_body,
+                    idempotency_key=send_idempotency_key,
+                    **send_options,
+                )
+            except ICollectorClientError as exc:
+                inbound.requires_human = True
+                inbound.human_notes = _truncate_text(f"Email send failed: {exc}", 500)
+                inbound.save(update_fields=["requires_human", "human_notes", "updated_at"])
+                return {"status": "failed", "reason": "send_error", "error": str(exc)}
+
+            outbound = MessagesOutbound.objects.create(
+                crm_data=related.get("crm_data"),
+                ingestion_data=related.get("ingestion_data"),
+                row_id=row_id_int,
+                borrower_name=str(context.get("borrower_name") or inbound.borrower_name or "Client"),
+                email=recipient_email,
+                channel=MessagesOutbound.Channel.EMAIL,
+                wave=int(context.get("wave") or 1),
+                amount=_safe_decimal(context.get("amount")),
+                total_due=_safe_decimal(context.get("amount_plus_fee")),
+                reason=str(context.get("reason_code") or ""),
+                message_content=email_body,
+                prompt_used=None,
+                model="daily_reject_workflow",
+                status=MessagesOutbound.Status.PENDING,
+                provider="icollector",
+            )
+            outbound.mark_sent(provider_response=send_result)
+        else:
+            try:
+                send_result = client.send_sms_extended(
+                    row_id=str(row_id_int),
+                    phone=inbound.from_phone,
+                    message=final_message,
+                    idempotency_key=f"reply-sms-caseflow-{idempotency_prefix}-{inbound.id}"[:120],
+                )
+            except ICollectorClientError as exc:
+                inbound.requires_human = True
+                inbound.human_notes = _truncate_text(f"SMS send failed: {exc}", 500)
+                inbound.save(update_fields=["requires_human", "human_notes", "updated_at"])
+                return {"status": "failed", "reason": "send_error", "error": str(exc)}
+
+            outbound = MessagesOutbound.objects.create(
+                crm_data=related.get("crm_data"),
+                ingestion_data=related.get("ingestion_data"),
+                row_id=row_id_int,
+                borrower_name=str(context.get("borrower_name") or inbound.borrower_name or "Client"),
+                phone=inbound.from_phone,
+                channel=MessagesOutbound.Channel.SMS,
+                wave=int(context.get("wave") or 1),
+                amount=_safe_decimal(context.get("amount")),
+                total_due=_safe_decimal(context.get("amount_plus_fee")),
+                reason=str(context.get("reason_code") or ""),
+                message_content=final_message,
+                prompt_used=None,
+                model="daily_reject_workflow",
+                status=MessagesOutbound.Status.PENDING,
+                provider="icollector",
+            )
+            outbound.mark_sent(provider_response=send_result)
+
+        if needs_wave:
+            case.refresh_from_db()
+            apply_daily_reject_wave_after_send(case)
+
+        ingestion_data = related.get("ingestion_data")
+        if ingestion_data:
+            ingestion_data.message_generated = True
+            ingestion_data.message_sent = True
+            ingestion_data.last_message_at = timezone.now()
+            ingestion_data.save(update_fields=["message_generated", "message_sent", "last_message_at", "updated_at"])
+
+        _mark_inbound_auto_reply_complete(inbound, outbound=outbound)
+        return {
+            "status": "sent",
+            "outbound_id": outbound.id,
+            "row_id": row_id_int,
+            "message_preview": outbound.message_content[:100],
+            "flow": "daily_reject_case",
+            "intent": proc.get("intent"),
+        }
+
+    if should_send and final_message and not automation_allowed:
+        _mark_inbound_auto_reply_complete(inbound, outbound=None)
+        return {
+            "status": "skipped",
+            "reason": "pilot_gate",
+            "note": "Deterministic reply blocked by row allowlist; case state updated.",
+            "flow": "daily_reject_case",
+            "intent": proc.get("intent"),
+        }
+
+    _mark_inbound_auto_reply_complete(inbound, outbound=None)
+    return {
+        "status": "skipped",
+        "reason": "no_outbound",
+        "note": "No outbound message for this inbound (e.g. legal stop or empty body).",
+        "flow": "daily_reject_case",
+        "intent": proc.get("intent"),
+    }
+
+
 def _find_related_records(phone: str, row_id: int = None, received_at: Optional[datetime] = None):
     """Find related CRM, Ingestion, and Outbound records by row/client and timestamp."""
     resolved_row_id = _parse_row_id(row_id)
@@ -882,6 +1217,12 @@ def _maybe_auto_reply_to_inbound(inbound: MessagesInbound, payload: Dict[str, ob
             requires_human=True,
         )
 
+    dr_result = _daily_reject_auto_reply_via_collection_case(
+        inbound, payload, related, partner_channel="sms"
+    )
+    if dr_result is not None:
+        return dr_result
+
     context = _extract_reply_context(related)
     previous_outbound = related.get("outbound_message")
     prior_message_text = getattr(previous_outbound, "message_content", "") if previous_outbound else ""
@@ -1006,6 +1347,56 @@ def _sanitize_reply_email(message: str) -> str:
     return cleaned
 
 
+def _normalize_email_greeting_name(raw_name: object) -> str:
+    text = _truncate_text(raw_name, 80).replace("\n", " ").strip()
+    text = re.sub(r"\s{2,}", " ", text)
+    if not text or text in {"{{client}}", "{{borrower_name}}"}:
+        return "Client"
+    if any(token in text for token in (".", "?", "!", "@")):
+        return "Client"
+    if len(text.split()) > 4:
+        return "Client"
+    return text
+
+
+def _format_professional_email_body(
+    message: str,
+    context: Dict[str, object],
+    *,
+    include_greeting: bool = True,
+) -> str:
+    """
+    Normalize email output into a professional plain-text format:
+    greeting + readable paragraphs + concise sign-off.
+    """
+    cleaned = _sanitize_reply_email(message)
+    if not cleaned:
+        return cleaned
+
+    sentences = [part.strip() for part in re.split(r"(?<=[.!?])\s+", cleaned) if part.strip()]
+    if sentences:
+        paragraphs = [" ".join(sentences[i:i + 2]) for i in range(0, len(sentences), 2)]
+        body_text = "\n\n".join(paragraphs)
+    else:
+        body_text = cleaned
+
+    greeting = ""
+    if include_greeting:
+        first_name = _normalize_email_greeting_name(
+            context.get("first_name") or context.get("borrower_name") or "Client"
+        )
+        greeting = f"Dear {first_name},"
+    signoff = "Regards,\nMike\niLoans Collections"
+
+    # If model already produced a complete sign-off, avoid duplicating one.
+    tail = body_text.lower()[-140:]
+    if any(marker in tail for marker in ("regards", "sincerely", "best,", "thank you")):
+        signoff = ""
+
+    parts = [greeting, body_text, signoff]
+    return "\n\n".join(part for part in parts if part).strip()
+
+
 def _maybe_auto_reply_to_inbound_email(
     inbound: MessagesInbound,
     payload: Dict[str, object],
@@ -1047,6 +1438,12 @@ def _maybe_auto_reply_to_inbound_email(
             requires_human=True,
         )
 
+    dr_result = _daily_reject_auto_reply_via_collection_case(
+        inbound, payload, related, partner_channel="email"
+    )
+    if dr_result is not None:
+        return dr_result
+
     context = _extract_reply_context(related)
     previous_outbound = related.get("outbound_message")
     prior_message_text = getattr(previous_outbound, "message_content", "") if previous_outbound else ""
@@ -1075,6 +1472,11 @@ def _maybe_auto_reply_to_inbound_email(
     raw_message = llm_result.get("answer") or llm_result.get("raw") or ""
     sanitized = _sanitize_reply_email(raw_message)
     final_message = sanitized if _is_email_contract_compliant(sanitized) else _build_email_contract_fallback_message(context)
+    final_message = _format_professional_email_body(
+        final_message,
+        context,
+        include_greeting=not bool(previous_outbound),
+    )
 
     recipient_email = (
         normalized_email
