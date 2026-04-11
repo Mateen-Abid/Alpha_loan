@@ -150,22 +150,35 @@ Return only SMS text, no JSON, no labels."""
 def _normalize_email_display_name(raw_name: object) -> str:
     """
     Normalize borrower display name for email greeting.
-    Falls back to 'Client' when value looks like placeholder/sentence noise.
+    Uses first-name style greeting and falls back to "Client" for placeholders/noise.
     """
-    text = " ".join(str(raw_name or "").replace("\n", " ").split())
+    text = " ".join(str(raw_name or "").replace("\r", " ").replace("\n", " ").split())
     if not text or text in {"{{client}}", "{{borrower_name}}"}:
         return "Client"
-    if any(token in text for token in (".", "?", "!", "@")):
+
+    first_word = text.split()[0].strip(" ,.;:-_")
+    if not first_word:
         return "Client"
-    if len(text.split()) > 4:
+
+    invalid_leads = {"this", "test", "dummy", "unknown", "none", "null", "n/a"}
+    if first_word.lower() in invalid_leads:
         return "Client"
-    return text
+
+    if any(ch in first_word for ch in ("@", "{", "}", "!", "?", "/")):
+        return "Client"
+
+    if not first_word[0].isalpha():
+        return "Client"
+
+    return first_word
 
 
 def build_openai_email_prompt(context: Dict[str, object]) -> str:
-    """Build professional final-notice email body from context."""
+    """Build deterministic initial email body with stable paragraph spacing."""
     client_name = _normalize_email_display_name(
-        context.get("borrower_name") or context.get("client") or "{{client}}"
+        context.get("borrower_name")
+        or context.get("client")
+        or "{{client}}"
     )
     tenant_name = str(
         context.get("tenant")
@@ -175,12 +188,12 @@ def build_openai_email_prompt(context: Dict[str, object]) -> str:
     deadline = str(context.get("stop_payment_deadline") or "2pm EST today").strip()
 
     return (
-        f"Dear {client_name},\n\n"
+        f"Dear {client_name},\r\n\r\n"
         "We are following up regarding the stop-payment instruction on your account that was made without prior notice. "
-        "This is a breach of your signed loan agreement.\n\n"
-        f"Please call us by {deadline} to confirm the stop payment has been removed and confirm your payment plan.\n\n"
-        "This is a final notice and requires immediate attention to avoid further escalation.\n\n"
-        "Regards,\n"
+        "This is a breach of your signed loan agreement.\r\n\r\n"
+        f"Please call us by {deadline} to confirm the stop payment has been removed and confirm your payment plan.\r\n\r\n"
+        "This is a final notice and requires immediate attention to avoid further escalation.\r\n\r\n"
+        "Regards,\r\n"
         f"{tenant_name} Collections Team"
     )
 
