@@ -4,11 +4,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
+import html
 import hashlib
 import hmac
 import json
 import logging
 import os
+import re
 import secrets
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlencode
@@ -38,6 +40,7 @@ class ICollectorClient:
     """Reusable API client for iCollector Partner Gateway."""
 
     DEFAULT_TIMEOUT = 15
+    _HTML_TAG_RE = re.compile(r"<[a-zA-Z][^>]*>")
 
     def __init__(self) -> None:
         self.base_url = os.getenv("ICOLLECTOR_BASE_URL", "https://app.icollector.ai").rstrip("/")
@@ -88,6 +91,27 @@ class ICollectorClient:
         if body is None:
             return b""
         return json.dumps(body, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
+
+    @classmethod
+    def _normalize_email_body(cls, body: str) -> str:
+        """
+        Normalize email body to HTML paragraphs per partner contract.
+
+        - If body already contains HTML tags, preserve as-is.
+        - Otherwise convert plain text into <p> blocks and preserve single line breaks via <br>.
+        """
+        text = (body or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+        if not text:
+            return ""
+        if cls._HTML_TAG_RE.search(text):
+            return text
+
+        paragraphs = [segment.strip() for segment in re.split(r"\n{2,}", text) if segment.strip()]
+        html_blocks: list[str] = []
+        for paragraph in paragraphs:
+            safe_paragraph = html.escape(paragraph).replace("\n", "<br>")
+            html_blocks.append(f"<p>{safe_paragraph}</p>")
+        return "".join(html_blocks)
 
     def _sign_request(
         self,
@@ -197,7 +221,7 @@ class ICollectorClient:
             "row_id": row_id,
             "to_email": to_email,
             "subject": subject,
-            "body": body,
+            "body": self._normalize_email_body(body),
         }
         return self.request("POST", "/api/partner-gateway/v1/email/send/", body=payload)
 
@@ -222,7 +246,7 @@ class ICollectorClient:
             "row_id": row_id,
             "to_email": to_email,
             "subject": subject,
-            "body": body,
+            "body": self._normalize_email_body(body),
         }
         if mailbox_role:
             payload["mailbox_role"] = mailbox_role
